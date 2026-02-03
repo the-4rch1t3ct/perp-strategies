@@ -1,0 +1,58 @@
+# Add these location blocks to /etc/nginx/sites-available/scalper-agent
+# Insert them AFTER the /health location block and BEFORE the catch-all location / block
+
+    # Indicators API endpoints (port 8002)
+    location /indicators {
+        proxy_pass http://127.0.0.1:8002/indicators;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $server_name;
+        proxy_http_version 1.1;
+        
+        # Increase buffer sizes for large JSON responses (all 31 symbols)
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+        proxy_max_temp_file_size 0;
+        proxy_buffering off;
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        
+        # CORS headers
+        add_header 'Access-Control-Allow-Origin' '*' always;
+        add_header 'Access-Control-Allow-Methods' 'GET, OPTIONS' always;
+        add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range' always;
+    }
+    
+    # Single symbol indicator endpoint
+    location ~ ^/indicators/(.+)$ {
+        proxy_pass http://127.0.0.1:8002/indicators/$1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $server_name;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        
+        add_header 'Access-Control-Allow-Origin' '*' always;
+    }
+    
+    # Symbols list endpoint
+    location /symbols {
+        proxy_pass http://127.0.0.1:8002/symbols;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $server_name;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        
+        add_header 'Access-Control-Allow-Origin' '*' always;
+    }

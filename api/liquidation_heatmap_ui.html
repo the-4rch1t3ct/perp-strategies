@@ -1,0 +1,1674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Predictive Liquidation Heatmap - Wagmi Global</title>
+    <!-- Lightweight Charts - Will be loaded dynamically -->
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0a0e27;
+            color: #e0e0e0;
+            overflow-x: hidden;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background: linear-gradient(135deg, #1a1f3a 0%, #0f1429 100%);
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        h1 {
+            color: #4fc3f7;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+
+        .subtitle {
+            color: #90a4ae;
+            font-size: 14px;
+        }
+
+        .controls {
+            background: #1a1f3a;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        label {
+            color: #90a4ae;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        input, select {
+            background: #0f1429;
+            border: 1px solid #2a2f4a;
+            color: #e0e0e0;
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+
+        input:focus, select:focus {
+            outline: none;
+            border-color: #4fc3f7;
+            box-shadow: 0 0 0 3px rgba(79, 195, 247, 0.1);
+        }
+
+        .search-input {
+            min-width: 200px;
+        }
+
+        button {
+            background: linear-gradient(135deg, #4fc3f7 0%, #29b6f6 100%);
+            border: none;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(79, 195, 247, 0.4);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .heatmap-container {
+            background: #1a1f3a;
+            border-radius: 12px;
+            padding: 20px;
+            min-height: 600px;
+            position: relative;
+        }
+
+        .price-chart {
+            width: 100%;
+            height: 600px;
+            position: relative;
+            background: #0a0e27;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid #1a1f3a;
+        }
+
+        #chartContainer {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+
+        .cluster-band {
+            position: absolute;
+            left: 60px;  /* Leave space for Y-axis labels */
+            right: 0;
+            height: 24px;  /* Thicker bands for visibility */
+            border-radius: 2px;
+            opacity: 0.85;
+            transition: all 0.3s;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            font-size: 11px;
+            font-weight: 600;
+            color: white;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+            z-index: 5;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+        }
+
+        .cluster-band:hover {
+            opacity: 1;
+            transform: scaleY(1.15);
+            z-index: 20;
+            box-shadow: 0 4px 16px rgba(255, 200, 0, 0.6);
+        }
+
+        /* Coinglass-style color gradient based on strength */
+        /* Purple (low) -> Pink -> Orange -> Yellow (high) */
+        .cluster-band[data-strength="0"] {
+            background: linear-gradient(90deg, rgba(75, 0, 130, 0.6) 0%, rgba(75, 0, 130, 0.8) 100%);
+        }
+        .cluster-band[data-strength="1"] {
+            background: linear-gradient(90deg, rgba(75, 0, 130, 0.7) 0%, rgba(138, 43, 226, 0.9) 100%);
+        }
+        .cluster-band[data-strength="2"] {
+            background: linear-gradient(90deg, rgba(138, 43, 226, 0.7) 0%, rgba(255, 20, 147, 0.9) 100%);
+        }
+        .cluster-band[data-strength="3"] {
+            background: linear-gradient(90deg, rgba(255, 20, 147, 0.7) 0%, rgba(255, 140, 0, 0.9) 100%);
+        }
+        .cluster-band[data-strength="4"] {
+            background: linear-gradient(90deg, rgba(255, 140, 0, 0.8) 0%, rgba(255, 215, 0, 1) 100%);
+        }
+        .cluster-band[data-strength="5"] {
+            background: linear-gradient(90deg, rgba(255, 215, 0, 0.9) 0%, rgba(255, 255, 0, 1) 100%);
+            box-shadow: 0 0 20px rgba(255, 255, 0, 0.8);
+        }
+
+        .current-price-line {
+            position: absolute;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: #4fc3f7;
+            z-index: 100;
+            box-shadow: 0 0 10px rgba(79, 195, 247, 0.8);
+        }
+
+        .price-label {
+            position: absolute;
+            right: 10px;
+            background: rgba(79, 195, 247, 0.9);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .cluster-info {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(26, 31, 58, 0.95);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #2a2f4a;
+            min-width: 200px;
+            max-width: 300px;
+            display: none;
+        }
+
+        .cluster-info.show {
+            display: block;
+        }
+
+        .cluster-info h3 {
+            color: #4fc3f7;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        .cluster-info-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 13px;
+        }
+
+        .cluster-info-label {
+            color: #90a4ae;
+        }
+
+        .cluster-info-value {
+            color: #e0e0e0;
+            font-weight: 600;
+        }
+
+        .instructions-section {
+            background: #1a1f3a;
+            border-radius: 12px;
+            padding: 30px;
+            margin-top: 30px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        .instructions-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .instruction-card {
+            background: rgba(15, 20, 41, 0.6);
+            border: 1px solid #2a2f4a;
+            border-radius: 8px;
+            padding: 20px;
+            transition: all 0.3s;
+        }
+
+        .instruction-card:hover {
+            border-color: #4fc3f7;
+            box-shadow: 0 4px 12px rgba(79, 195, 247, 0.2);
+            transform: translateY(-2px);
+        }
+
+        .instruction-card h3 {
+            font-size: 16px;
+            margin-bottom: 12px;
+        }
+
+        .instruction-card ul {
+            margin: 0;
+            padding-left: 20px;
+        }
+
+        .instruction-card li {
+            margin-bottom: 8px;
+        }
+
+        .instruction-card strong {
+            color: #e0e0e0;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-card {
+            background: #1a1f3a;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #2a2f4a;
+        }
+
+        .stat-label {
+            color: #90a4ae;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+
+        .stat-value {
+            color: #4fc3f7;
+            font-size: 24px;
+            font-weight: 700;
+        }
+
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 400px;
+            color: #90a4ae;
+        }
+
+        .spinner {
+            border: 3px solid #2a2f4a;
+            border-top: 3px solid #4fc3f7;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error {
+            background: #ef5350;
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .strength-bar {
+            height: 4px;
+            background: #2a2f4a;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 5px;
+        }
+
+        .strength-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4fc3f7 0%, #29b6f6 100%);
+            transition: width 0.3s;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔥 Predictive Liquidation Heatmap</h1>
+            <div class="subtitle">Risk zones calculated BEFORE liquidations occur • Based on Open Interest & Leverage Tiers</div>
+        </header>
+
+        <div class="stats" id="stats">
+            <div class="stat-card">
+                <div class="stat-label">Current Price</div>
+                <div class="stat-value" id="currentPrice">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Clusters</div>
+                <div class="stat-value" id="totalClusters">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Long Clusters</div>
+                <div class="stat-value" id="longClusters">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Short Clusters</div>
+                <div class="stat-value" id="shortClusters">0</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <div class="control-group">
+                <label>Symbol</label>
+                <input type="text" id="symbolInput" class="search-input" placeholder="ETHUSDT" value="ETHUSDT" list="symbols">
+                <datalist id="symbols"></datalist>
+            </div>
+            <div class="control-group">
+                <label>Min Strength</label>
+                <input type="number" id="minStrength" value="0.2" min="0" max="1" step="0.05" title="Filter out weaker signals (0.0-1.0)">
+            </div>
+            <div class="control-group">
+                <label>Max Distance (%)</label>
+                <input type="number" id="maxDistance" value="5" min="0" max="50" step="0.5" title="Maximum distance from current price">
+            </div>
+            <div class="control-group">
+                <label>Signal Quality</label>
+                <select id="signalQuality" style="padding: 8px 12px; border-radius: 6px; border: 1px solid #2a2f4a; background: #0f1429; color: #e0e0e0; font-size: 14px; cursor: pointer;" title="Filter signal quality">
+                    <option value="all">All Signals</option>
+                    <option value="high" selected>High Quality Only</option>
+                    <option value="very_high">Very High Only</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Timeframe</label>
+                <select id="timeframeSelect" style="padding: 8px 12px; border-radius: 6px; border: 1px solid #2a2f4a; background: #0f1429; color: #e0e0e0; font-size: 14px; cursor: pointer;">
+                    <option value="1m">1 Minute</option>
+                    <option value="3m">3 Minutes</option>
+                    <option value="5m">5 Minutes</option>
+                    <option value="15m">15 Minutes</option>
+                    <option value="30m">30 Minutes</option>
+                    <option value="1h" selected>1 Hour</option>
+                    <option value="2h">2 Hours</option>
+                    <option value="4h">4 Hours</option>
+                    <option value="6h">6 Hours</option>
+                    <option value="8h">8 Hours</option>
+                    <option value="12h">12 Hours</option>
+                    <option value="1d">1 Day</option>
+                    <option value="3d">3 Days</option>
+                    <option value="1w">1 Week</option>
+                </select>
+            </div>
+            <div class="control-group" style="flex: 1; min-width: 200px;">
+                <label>&nbsp;</label>
+                <button onclick="loadHeatmap()">Load Heatmap</button>
+            </div>
+            <div class="control-group" style="flex: 1; min-width: 200px;">
+                <label>&nbsp;</label>
+                <button onclick="toggleAutoRefresh()" id="autoRefreshBtn">Auto Refresh: OFF</button>
+            </div>
+        </div>
+
+        <p style="color: #90a4ae; font-size: 12px; margin: -8px 0 12px 0; max-width: 800px;">
+            <strong style="color: #b0bec5;">Chart legend:</strong> Yellow/orange bands = liquidation clusters (risk zones). 
+            <span style="color: #66bb6a;">Green dashed</span> = TP, <span style="color: #ef5350;">red dotted</span> = SL. 
+            LONG TP/SL show when there are short clusters above; SHORT TP/SL when there are long clusters below. 
+            <a href="#tp-sl-explainer" style="color: #4fc3f7;">More on TP/SL vs clusters ↓</a>
+        </p>
+        <div class="heatmap-container">
+            <div class="price-chart" id="priceChart">
+                <div id="chartContainer" style="width: 100%; height: 100%;"></div>
+                <div class="loading" id="chartLoading" style="display: none;">
+                    <div class="spinner"></div>
+                </div>
+            </div>
+            <div class="cluster-info" id="clusterInfo">
+                <h3 id="clusterInfoTitle">Cluster Details</h3>
+                <div class="cluster-info-item">
+                    <span class="cluster-info-label">Price Level:</span>
+                    <span class="cluster-info-value" id="clusterPrice">-</span>
+                </div>
+                <div class="cluster-info-item">
+                    <span class="cluster-info-label">Side:</span>
+                    <span class="cluster-info-value" id="clusterSide">-</span>
+                </div>
+                <div class="cluster-info-item">
+                    <span class="cluster-info-label">Strength:</span>
+                    <span class="cluster-info-value" id="clusterStrength">-</span>
+                </div>
+                <div class="strength-bar">
+                    <div class="strength-fill" id="clusterStrengthBar" style="width: 0%"></div>
+                </div>
+                <div class="cluster-info-item">
+                    <span class="cluster-info-label">Liquidation Count:</span>
+                    <span class="cluster-info-value" id="clusterCount">-</span>
+                </div>
+                <div class="cluster-info-item">
+                    <span class="cluster-info-label">Total Notional:</span>
+                    <span class="cluster-info-value" id="clusterNotional">-</span>
+                </div>
+                <div class="cluster-info-item">
+                    <span class="cluster-info-label">Distance:</span>
+                    <span class="cluster-info-value" id="clusterDistance">-</span>
+                </div>
+            </div>
+            </div>
+        </div>
+
+        <!-- Instructions Section -->
+        <div class="instructions-section">
+            <h2 style="color: #4fc3f7; margin-bottom: 20px; font-size: 20px;">📖 How to Use the Predictive Liquidation Heatmap</h2>
+            
+            <div class="instructions-grid">
+                <div class="instruction-card">
+                    <h3 style="color: #66bb6a; margin-bottom: 10px;">🎯 Understanding the Heat Bands</h3>
+                    <ul style="color: #b0bec5; line-height: 1.8; padding-left: 20px;">
+                        <li><strong style="color: #ffd700;">Bright Yellow/Orange bands</strong> = High Open Interest concentration (strong magnet zones)</li>
+                        <li><strong style="color: #ff8c00;">Orange bands</strong> = Medium-high risk zones</li>
+                        <li><strong style="color: #ff1493;">Pink bands</strong> = Medium risk zones</li>
+                        <li><strong style="color: #8a2be2;">Purple bands</strong> = Lower risk zones</li>
+                        <li><strong style="color: #4fc3f7;">Blue line</strong> = Current market price</li>
+                    </ul>
+                </div>
+
+                <div class="instruction-card">
+                    <h3 style="color: #66bb6a; margin-bottom: 10px;">📍 What the Bands Represent</h3>
+                    <ul style="color: #b0bec5; line-height: 1.8; padding-left: 20px;">
+                        <li><strong>Above current price</strong> = SHORT liquidation zones (potential resistance)</li>
+                        <li><strong>Below current price</strong> = LONG liquidation zones (potential support)</li>
+                        <li><strong>Thicker bands</strong> = Higher Open Interest at that price level</li>
+                        <li><strong>Brighter colors</strong> = More concentrated risk (stronger magnet effect)</li>
+                    </ul>
+                </div>
+
+                <div class="instruction-card">
+                    <h3 style="color: #66bb6a; margin-bottom: 10px;">⚙️ Using the Filters</h3>
+                    <ul style="color: #b0bec5; line-height: 1.8; padding-left: 20px;">
+                        <li><strong>Min Strength (0.0 - 1.0):</strong> Filter out weaker clusters. Higher values show only the strongest risk zones.</li>
+                        <li><strong>Max Distance (%):</strong> Limit how far from current price to display clusters. Lower values focus on nearby zones.</li>
+                        <li><strong>Symbol:</strong> Search for any supported trading pair (e.g., BTCUSDT, ETHUSDT)</li>
+                        <li><strong>Auto Refresh:</strong> Enable to automatically update every 5 seconds</li>
+                    </ul>
+                </div>
+
+                <div class="instruction-card">
+                    <h3 style="color: #66bb6a; margin-bottom: 10px;">🖱️ Interacting with the Heatmap</h3>
+                    <ul style="color: #b0bec5; line-height: 1.8; padding-left: 20px;">
+                        <li><strong>Hover over bands</strong> = See cluster details in the top-right panel</li>
+                        <li><strong>Click a band</strong> = Lock cluster details for that specific zone</li>
+                        <li><strong>Y-axis (left)</strong> = Price levels</li>
+                        <li><strong>Color legend (left)</strong> = Heat intensity scale (High to Low)</li>
+                    </ul>
+                </div>
+
+                <div class="instruction-card">
+                    <h3 style="color: #66bb6a; margin-bottom: 10px;">💡 Trading Insights</h3>
+                    <ul style="color: #b0bec5; line-height: 1.8; padding-left: 20px;">
+                        <li><strong>Support/Resistance:</strong> Strong clusters often act as price magnets where reversals occur</li>
+                        <li><strong>Liquidation Cascades:</strong> When price reaches a bright yellow zone, expect increased volatility</li>
+                        <li><strong>Entry Zones:</strong> Enter positions near strong clusters for better risk/reward ratios</li>
+                        <li><strong>Stop Loss Placement:</strong> Avoid placing stops at cluster levels (high liquidation risk)</li>
+                    </ul>
+                </div>
+
+                <div class="instruction-card">
+                    <h3 style="color: #66bb6a; margin-bottom: 10px;">📊 Reading Cluster Details</h3>
+                    <ul style="color: #b0bec5; line-height: 1.8; padding-left: 20px;">
+                        <li><strong>Price Level:</strong> Exact price where liquidations would occur</li>
+                        <li><strong>Side:</strong> LONG (below price) or SHORT (above price) positions at risk</li>
+                        <li><strong>Strength:</strong> Intensity score (0-1), higher = more concentrated risk</li>
+                        <li><strong>Liquidation Count:</strong> Estimated number of positions that would liquidate</li>
+                        <li><strong>Total Notional:</strong> Total USD value of Open Interest at risk</li>
+                        <li><strong>Distance:</strong> Percentage distance from current price</li>
+                    </ul>
+                </div>
+
+                <div id="tp-sl-explainer" class="instruction-card" style="grid-column: 1 / -1; border: 2px solid #4fc3f7; background: rgba(79, 195, 247, 0.08);">
+                    <h3 style="color: #4fc3f7; margin-bottom: 12px; font-size: 18px;">📐 Understanding TP/SL Lines vs Cluster Bands</h3>
+                    <p style="color: #b0bec5; margin-bottom: 12px; line-height: 1.7;">
+                        <strong style="color: #e0e0e0;">Cluster bands</strong> (e.g. “LONG @ $433 (100%)”) show <em>where liquidations would happen</em> — they are risk zones, not trade targets. 
+                        <strong style="color: #e0e0e0;">TP (Take Profit) and SL (Stop Loss) lines</strong> are the strategy’s suggested exit levels for a trade.
+                    </p>
+                    <ul style="color: #b0bec5; line-height: 1.8; padding-left: 20px; margin-bottom: 12px;">
+                        <li><strong style="color: #66bb6a;">LONG TP / LONG SL</strong> = Suggested targets for a <strong>long</strong> position. They appear when there are <strong>short clusters above</strong> price (resistance). TP is toward that resistance.</li>
+                        <li><strong style="color: #ef5350;">SHORT TP / SHORT SL</strong> = Suggested targets for a <strong>short</strong> position. They appear when there are <strong>long clusters below</strong> price (support). TP is toward that support.</li>
+                    </ul>
+                    <p style="color: #90a4ae; margin: 0; font-size: 13px; line-height: 1.6; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 6px;">
+                        <strong>Why you sometimes see only one side:</strong> If the chart has only <strong>long clusters below</strong> (e.g. 3 Long Clusters, 0 Short Clusters), the strategy only suggests a <strong>SHORT</strong> trade toward that support — so only <strong>SHORT TP</strong> and <strong>SHORT SL</strong> are drawn. <strong>LONG TP/SL</strong> appear only when there are <strong>short clusters above</strong> (resistance). Both sets of lines show when the symbol has clusters on both sides.
+                    </p>
+                </div>
+            </div>
+
+            <div style="background: rgba(79, 195, 247, 0.1); border-left: 3px solid #4fc3f7; padding: 15px; margin-top: 20px; border-radius: 4px;">
+                <p style="color: #4fc3f7; margin: 0; font-weight: 600;">💡 Pro Tip:</p>
+                <p style="color: #b0bec5; margin: 5px 0 0 0; line-height: 1.6;">
+                    This is a <strong>PREDICTIVE</strong> heatmap - it shows risk zones <strong>BEFORE</strong> liquidations occur, 
+                    calculated from Open Interest data and leverage tiers. The heatmap updates in real-time as price moves, 
+                    keeping liquidation levels relative to current market conditions.
+                </p>
+            </div>
+        </div>
+
+        <script>
+        const API_BASE = window.location.origin;
+        let autoRefreshInterval = null;
+        let autoRefreshEnabled = false;
+        let currentData = null;
+        
+        // Chart and cluster state
+        let chart = null;
+        let candlestickSeries = null;
+        let heatmapSeries = null;
+        let clusterStates = new Map(); // Map<price, {cluster, active, firstSeen, lastSeen}>
+        let priceHistory = []; // Array of {time, price, high, low}
+        let currentSymbol = 'ETHUSDT';
+        let priceUpdateInterval = null;
+        let currentTimeframe = '1h'; // Default timeframe
+
+        // Load symbols on startup
+        async function loadSymbols() {
+            try {
+                const response = await fetch(`${API_BASE}/api/symbols`);
+                const data = await response.json();
+                
+                const datalist = document.getElementById('symbols');
+                datalist.innerHTML = '';
+                
+                data.symbols.forEach(symbol => {
+                    const option = document.createElement('option');
+                    option.value = symbol;
+                    datalist.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Error loading symbols:', error);
+            }
+        }
+
+        // Load heatmap data
+        async function loadHeatmap() {
+            const symbol = document.getElementById('symbolInput').value.toUpperCase();
+            const minStrength = parseFloat(document.getElementById('minStrength').value);
+            const maxDistance = parseFloat(document.getElementById('maxDistance').value);
+            const timeframe = document.getElementById('timeframeSelect').value;
+            const signalQuality = document.getElementById('signalQuality').value;
+
+            if (!symbol) {
+                alert('Please enter a symbol');
+                return;
+            }
+
+            currentSymbol = symbol;
+            currentTimeframe = timeframe;
+            const loadingEl = document.getElementById('chartLoading');
+            if (loadingEl) loadingEl.style.display = 'block';
+
+            try {
+                // Fetch heatmap data (required)
+                const heatmapResponse = await fetch(`${API_BASE}/api/heatmap/${symbol}?min_strength=${minStrength}&max_distance=${maxDistance}`);
+                
+                if (!heatmapResponse.ok) {
+                    const errorText = await heatmapResponse.text();
+                    throw new Error(`HTTP ${heatmapResponse.status}: ${errorText || heatmapResponse.statusText}`);
+                }
+
+                const data = await heatmapResponse.json();
+                currentData = data;
+
+                if (!data.success) {
+                    throw new Error(data.message || 'API returned unsuccessful response');
+                }
+
+                // Fetch trading signal (optional - for TP/SL targets)
+                // Use strategy defaults (0.6, 3.0) to align with agent strategy
+                try {
+                    const strategyMinStrength = 0.6;  // Strategy default
+                    const strategyMaxDistance = 3.0;   // Strategy default
+                    const signalResponse = await fetch(`${API_BASE}/api/trade/${symbol}?min_strength=${strategyMinStrength}&max_distance=${strategyMaxDistance}`);
+                    if (signalResponse.ok) {
+                        const signalData = await signalResponse.json();
+                        currentTradingSignal = signalData;
+                        console.log(`✅ Loaded trading signal for ${symbol} (aligned with strategy: min_strength=${strategyMinStrength}, max_distance=${strategyMaxDistance})`);
+                    } else {
+                        console.warn(`⚠️ Could not load trading signal (HTTP ${signalResponse.status}) - TP/SL targets will not be shown`);
+                        currentTradingSignal = null;
+                    }
+                } catch (signalError) {
+                    console.warn('⚠️ Error loading trading signal (TP/SL targets disabled):', signalError.message);
+                    currentTradingSignal = null;
+                }
+
+                renderHeatmap(data);
+                updateStats(data);
+                
+                // Start real-time updates
+                startPriceUpdates();
+
+            } catch (error) {
+                const chartContainer = document.getElementById('chartContainer');
+                let errorMessage = error.message;
+                
+                // Provide helpful error messages
+                if (errorMessage.includes('400') || errorMessage.includes('not supported')) {
+                    errorMessage = `Symbol "${symbol}" is not supported. Supported symbols: ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, TRXUSDT, DOGEUSDT, ADAUSDT, BCHUSDT, LINKUSDT, XMRUSDT`;
+                } else if (errorMessage.includes('404')) {
+                    errorMessage = `Symbol "${symbol}" not found. Please check the symbol name.`;
+                } else if (errorMessage.includes('500')) {
+                    errorMessage = `Server error. Please try again in a moment.`;
+                }
+                
+                if (chartContainer) {
+                    chartContainer.innerHTML = `<div class="error" style="color: #ef5350; padding: 20px; text-align: center; background: rgba(239, 83, 80, 0.1); border-radius: 8px; margin: 20px;">Error loading heatmap: ${errorMessage}<br><small style="color: #90a4ae;">Check browser console for details</small></div>`;
+                }
+                console.error('Error loading heatmap:', error);
+                console.error('Stack trace:', error.stack);
+            } finally {
+                if (loadingEl) loadingEl.style.display = 'none';
+            }
+        }
+
+        // Initialize chart with lightweight-charts
+        function initChart() {
+            try {
+                const chartContainer = document.getElementById('chartContainer');
+                if (!chartContainer) {
+                    console.error('Chart container not found');
+                    return false;
+                }
+
+                // Check if LightweightCharts is loaded
+                if (typeof LightweightCharts === 'undefined') {
+                    console.error('LightweightCharts library not loaded');
+                    console.error('Window object:', typeof window);
+                    console.error('Available globals:', Object.keys(window).filter(k => k.toLowerCase().includes('chart')));
+                    return false;
+                }
+
+                // Verify LightweightCharts has createChart method
+                if (typeof LightweightCharts.createChart !== 'function') {
+                    console.error('LightweightCharts.createChart is not a function');
+                    console.error('LightweightCharts object:', LightweightCharts);
+                    console.error('Available methods:', Object.keys(LightweightCharts));
+                    return false;
+                }
+
+                // Destroy existing chart if it exists
+                if (chart) {
+                    chart.remove();
+                    chart = null;
+                    candlestickSeries = null;
+                }
+
+                // Ensure container has dimensions
+                const containerWidth = chartContainer.clientWidth || chartContainer.offsetWidth || 800;
+                const containerHeight = chartContainer.clientHeight || chartContainer.offsetHeight || 600;
+                
+                if (containerWidth === 0 || containerHeight === 0) {
+                    console.error('Chart container has zero dimensions:', {
+                        width: containerWidth,
+                        height: containerHeight,
+                        clientWidth: chartContainer.clientWidth,
+                        clientHeight: chartContainer.clientHeight
+                    });
+                    // Set minimum dimensions
+                    chartContainer.style.width = '800px';
+                    chartContainer.style.height = '600px';
+                }
+
+                // Create chart with proper error handling
+                try {
+                    console.log('Creating chart with dimensions:', containerWidth, 'x', containerHeight);
+                    console.log('LightweightCharts version check:', {
+                        hasCreateChart: typeof LightweightCharts.createChart,
+                        hasCrosshairMode: typeof LightweightCharts.CrosshairMode,
+                        hasLineStyle: typeof LightweightCharts.LineStyle
+                    });
+
+                    chart = LightweightCharts.createChart(chartContainer, {
+                        layout: {
+                            background: { color: '#0a0e27' },
+                            textColor: '#d1d5db',
+                        },
+                        grid: {
+                            vertLines: { color: '#1a1f3a' },
+                            horzLines: { color: '#1a1f3a' },
+                        },
+                        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                        rightPriceScale: { borderColor: '#2a2f4a' },
+                timeScale: {
+                    borderColor: '#2a2f4a',
+                    timeVisible: true,
+                    secondsVisible: false,
+                    rightOffset: 10,
+                    barSpacing: 3,
+                },
+                        width: containerWidth,
+                        height: containerHeight,
+                    });
+
+                    if (!chart) {
+                        console.error('Failed to create chart - chart object is null');
+                        return false;
+                    }
+
+                    console.log('Chart created, type:', typeof chart, 'constructor:', chart.constructor.name);
+
+                    // Try different methods to add candlestick series
+                    // The library version might use different method names
+                    let seriesCreated = false;
+                    
+                    // Debug: Log what's available
+                    console.log('Checking available methods...');
+                    const chartMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(chart));
+                    const addMethods = chartMethods.filter(name => name.toLowerCase().includes('add') && name.toLowerCase().includes('series'));
+                    console.log('Methods with "add" and "series":', addMethods);
+                    console.log('All add methods:', chartMethods.filter(name => name.startsWith('add')));
+                    
+                    // Method 1: Try addCandlestickSeries (standard method for newer versions)
+                    if (typeof chart.addCandlestickSeries === 'function') {
+                        console.log('Method 1: Using addCandlestickSeries...');
+                        try {
+                            candlestickSeries = chart.addCandlestickSeries({
+                                upColor: '#26a69a',
+                                downColor: '#ef5350',
+                                borderVisible: false,
+                                wickUpColor: '#26a69a',
+                                wickDownColor: '#ef5350',
+                            });
+                            if (candlestickSeries) {
+                                seriesCreated = true;
+                                console.log('✅ Successfully created series using addCandlestickSeries');
+                            }
+                        } catch (e) {
+                            console.error('addCandlestickSeries failed:', e.message);
+                        }
+                    }
+                    
+                    // Method 2: Try addSeries with CandlestickSeries class (v5 API)
+                    if (!seriesCreated && typeof chart.addSeries === 'function') {
+                        console.log('Method 2: Trying addSeries with CandlestickSeries (v5 API)...');
+                        try {
+                            // Check for CandlestickSeries class (v5 standalone build)
+                            if (LightweightCharts && LightweightCharts.CandlestickSeries) {
+                                console.log('CandlestickSeries class found');
+                                candlestickSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+                                    upColor: '#26a69a',
+                                    downColor: '#ef5350',
+                                    borderVisible: false,
+                                    wickUpColor: '#26a69a',
+                                    wickDownColor: '#ef5350',
+                                });
+                                if (candlestickSeries) {
+                                    seriesCreated = true;
+                                    console.log('✅ Successfully created series using addSeries with CandlestickSeries (v5)');
+                                }
+                            }
+                        } catch (e) {
+                            console.error('addSeries with CandlestickSeries failed:', e.message);
+                        }
+                    }
+                    
+                    // Method 2b: Try addSeries with SeriesType enum (v4 API)
+                    if (!seriesCreated && typeof chart.addSeries === 'function') {
+                        console.log('Method 2b: Trying addSeries with SeriesType enum (v4 API)...');
+                        try {
+                            // Check for SeriesType enum
+                            if (LightweightCharts && LightweightCharts.SeriesType) {
+                                console.log('SeriesType enum found:', Object.keys(LightweightCharts.SeriesType));
+                                const seriesType = LightweightCharts.SeriesType.Candlestick || 
+                                                  LightweightCharts.SeriesType['Candlestick'] ||
+                                                  'Candlestick';
+                                candlestickSeries = chart.addSeries(seriesType, {
+                                    upColor: '#26a69a',
+                                    downColor: '#ef5350',
+                                    borderVisible: false,
+                                    wickUpColor: '#26a69a',
+                                    wickDownColor: '#ef5350',
+                                });
+                                if (candlestickSeries) {
+                                    seriesCreated = true;
+                                    console.log('✅ Successfully created series using addSeries with SeriesType');
+                                }
+                            }
+                        } catch (e) {
+                            console.error('addSeries with SeriesType failed:', e.message);
+                        }
+                    }
+                    
+                    // Method 3: Try addSeries with string type (older API)
+                    if (!seriesCreated && typeof chart.addSeries === 'function') {
+                        console.log('Method 3: Trying addSeries with string "Candlestick"...');
+                        try {
+                            candlestickSeries = chart.addSeries('Candlestick', {
+                                upColor: '#26a69a',
+                                downColor: '#ef5350',
+                                borderVisible: false,
+                                wickUpColor: '#26a69a',
+                                wickDownColor: '#ef5350',
+                            });
+                            if (candlestickSeries) {
+                                seriesCreated = true;
+                                console.log('✅ Successfully created series using addSeries with string');
+                            }
+                        } catch (e) {
+                            console.error('addSeries with string failed:', e.message, e.stack);
+                        }
+                    }
+                    
+                    // Method 4: Try addSeries with just options (might auto-detect)
+                    if (!seriesCreated && typeof chart.addSeries === 'function') {
+                        console.log('Method 4: Trying addSeries with just options (auto-detect)...');
+                        try {
+                            candlestickSeries = chart.addSeries({
+                                type: 'Candlestick',
+                                upColor: '#26a69a',
+                                downColor: '#ef5350',
+                                borderVisible: false,
+                                wickUpColor: '#26a69a',
+                                wickDownColor: '#ef5350',
+                            });
+                            if (candlestickSeries) {
+                                seriesCreated = true;
+                                console.log('✅ Successfully created series using addSeries with options object');
+                            }
+                        } catch (e) {
+                            console.error('addSeries with options failed:', e.message);
+                        }
+                    }
+                    
+                    if (!seriesCreated) {
+                        console.error('❌ Failed to create candlestick series with any method');
+                        console.error('Chart methods:', chartMethods);
+                        console.error('LightweightCharts keys:', Object.keys(LightweightCharts || {}));
+                        console.error('LightweightCharts properties:', Object.getOwnPropertyNames(LightweightCharts || {}));
+                        if (LightweightCharts && LightweightCharts.SeriesType) {
+                            console.error('SeriesType values:', Object.values(LightweightCharts.SeriesType));
+                        }
+                        if (LightweightCharts && LightweightCharts.CandlestickSeries) {
+                            console.error('CandlestickSeries found but failed to use');
+                        }
+                        return false;
+                    }
+
+                    if (!candlestickSeries) {
+                        console.error('Failed to create candlestick series - series object is null');
+                        return false;
+                    }
+
+                    console.log('Chart and series created successfully');
+                    console.log('Candlestick series type:', typeof candlestickSeries);
+                } catch (chartError) {
+                    console.error('Error creating chart:', chartError);
+                    console.error('Error details:', {
+                        message: chartError.message,
+                        stack: chartError.stack,
+                        chartType: typeof chart,
+                        LightweightChartsType: typeof LightweightCharts,
+                        errorName: chartError.name
+                    });
+                    return false;
+                }
+
+                window.addEventListener('resize', () => {
+                    if (chart && chartContainer) {
+                        chart.applyOptions({
+                            width: chartContainer.clientWidth,
+                            height: chartContainer.clientHeight,
+                        });
+                    }
+                });
+
+                console.log('Chart initialized successfully');
+                return true;
+            } catch (error) {
+                console.error('Error initializing chart:', error);
+                return false;
+            }
+        }
+
+        // Fetch real OHLC data from Binance
+        async function fetchBinanceOHLC(symbol, timeframe, limit = 500) {
+            try {
+                // Convert timeframe to Binance format
+                const binanceTimeframeMap = {
+                    '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
+                    '1h': '1h', '2h': '2h', '4h': '4h', '6h': '6h', '8h': '8h',
+                    '12h': '12h', '1d': '1d', '3d': '3d', '1w': '1w'
+                };
+                
+                const binanceInterval = binanceTimeframeMap[timeframe] || '1h';
+                
+                // Binance Futures API endpoint
+                const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
+                
+                console.log(`📊 Fetching ${limit} ${binanceInterval} candles for ${symbol} from Binance...`);
+                
+                const response = await fetch(url);
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`Binance API error ${response.status}: ${errorText}`);
+                }
+                
+                const klines = await response.json();
+                
+                if (!klines || klines.length === 0) {
+                    throw new Error('No data returned from Binance');
+                }
+                
+                // Convert Binance format to lightweight-charts format
+                // Binance format: [openTime, open, high, low, close, volume, closeTime, ...]
+                const data = klines.map(kline => ({
+                    time: Math.floor(kline[0] / 1000), // Convert ms to seconds
+                    open: parseFloat(kline[1]),
+                    high: parseFloat(kline[2]),
+                    low: parseFloat(kline[3]),
+                    close: parseFloat(kline[4]),
+                })).filter(candle => candle.time > 0 && candle.open > 0); // Filter invalid data
+                
+                if (data.length === 0) {
+                    throw new Error('No valid candles after processing');
+                }
+                
+                console.log(`✅ Fetched ${data.length} real candles from Binance`);
+                const minPrice = Math.min(...data.map(d => d.low));
+                const maxPrice = Math.max(...data.map(d => d.high));
+                console.log(`📈 Price range: $${formatPrice(minPrice)} - $${formatPrice(maxPrice)}`);
+                console.log(`🕐 Time range: ${new Date(data[0].time * 1000).toLocaleTimeString()} - ${new Date(data[data.length - 1].time * 1000).toLocaleTimeString()}`);
+                
+                return data;
+            } catch (error) {
+                console.error('❌ Error fetching Binance OHLC data:', error);
+                console.error('Error details:', {
+                    symbol,
+                    timeframe,
+                    limit,
+                    message: error.message
+                });
+                // Fallback to dummy data if API fails
+                console.warn('⚠️ Falling back to dummy data');
+                const fallbackPrice = 90000; // Default fallback price
+                return generateDummyOHLC(fallbackPrice, limit, timeframe);
+            }
+        }
+
+        // Generate dummy OHLC data as fallback
+        function generateDummyOHLC(basePrice, bars = 200, timeframe = '1h') {
+            const data = [];
+            let currentPrice = basePrice;
+            const now = Math.floor(Date.now() / 1000);
+            const timeframeSeconds = getTimeframeSeconds(timeframe);
+            
+            // Adjust volatility based on timeframe (longer timeframes = more volatility)
+            const volatilityMultiplier = Math.sqrt(timeframeSeconds / 3600); // Scale volatility
+            
+            for (let i = bars - 1; i >= 0; i--) {
+                const time = now - (i * timeframeSeconds);
+                const change = (Math.random() - 0.5) * basePrice * 0.02 * volatilityMultiplier;
+                const open = currentPrice;
+                const close = currentPrice + change;
+                const high = Math.max(open, close) + Math.random() * basePrice * 0.01 * volatilityMultiplier;
+                const low = Math.min(open, close) - Math.random() * basePrice * 0.01 * volatilityMultiplier;
+                
+                data.push({ time, open, high, low, close });
+                currentPrice = close;
+            }
+            
+            return data;
+        }
+
+        // Get timeframe in seconds
+        function getTimeframeSeconds(timeframe) {
+            const timeframeMap = {
+                '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800,
+                '1h': 3600, '2h': 7200, '4h': 14400, '6h': 21600, '8h': 28800,
+                '12h': 43200, '1d': 86400, '3d': 259200, '1w': 604800
+            };
+            return timeframeMap[timeframe] || 3600;
+        }
+
+        // Get appropriate decimal places for price display based on price range
+        function getPriceDecimals(price) {
+            if (!price || price <= 0) return 2;
+            
+            if (price < 0.01) return 6;      // Very low prices (e.g., SHIB): 6 decimals
+            if (price < 0.1) return 5;       // Low prices (e.g., DOGE ~$0.12): 5 decimals
+            if (price < 1) return 4;         // Sub-dollar (e.g., $0.50): 4 decimals
+            if (price < 10) return 3;        // Single digits (e.g., $5): 3 decimals
+            if (price < 100) return 2;       // Double digits (e.g., $50): 2 decimals
+            return 2;                        // Higher prices (e.g., BTC, ETH): 2 decimals
+        }
+
+        // Format price with appropriate decimals
+        function formatPrice(price) {
+            if (!price || price <= 0) return '-';
+            const decimals = getPriceDecimals(price);
+            return price.toFixed(decimals);
+        }
+
+        // Get color for cluster strength
+        function getClusterColor(strength, maxStrength) {
+            const normalized = Math.min(1, strength / maxStrength);
+            if (normalized >= 0.8) return '#ffff00';
+            if (normalized >= 0.6) return '#ff8c00';
+            if (normalized >= 0.4) return '#ff1493';
+            if (normalized >= 0.2) return '#8a2be2';
+            return '#4b0082';
+        }
+
+        // Check cluster collision (price breaking through)
+        function checkClusterCollisions(currentPrice, high, low) {
+            const now = Math.floor(Date.now() / 1000);
+            let updated = false;
+
+            clusterStates.forEach((state, price) => {
+                if (!state.active) return;
+                const cluster = state.cluster;
+                const clusterPrice = cluster.price_level;
+                
+                let broken = false;
+                if (cluster.side === 'long' && (currentPrice <= clusterPrice || low <= clusterPrice)) {
+                    broken = true;
+                } else if (cluster.side === 'short' && (currentPrice >= clusterPrice || high >= clusterPrice)) {
+                    broken = true;
+                }
+
+                if (broken) {
+                    state.active = false;
+                    state.lastSeen = now;
+                    updated = true;
+                } else {
+                    state.lastSeen = now;
+                }
+            });
+
+            return updated;
+        }
+
+        // Store cluster price lines
+        let clusterPriceLines = new Map();
+        // Store TP and SL target lines
+        let tpTargetLines = new Map();
+        let currentTradingSignal = null;
+
+        // Render heatmap bands as horizontal price lines (with noise reduction)
+        function renderHeatmapBands() {
+            if (!chart || !candlestickSeries) return;
+            const now = Math.floor(Date.now() / 1000);
+            const allClusters = Array.from(clusterStates.values());
+            
+            if (allClusters.length === 0) {
+                clusterPriceLines.forEach((line) => candlestickSeries.removePriceLine(line));
+                clusterPriceLines.clear();
+                return;
+            }
+
+            // Filter active clusters only
+            const activeClusters = allClusters.filter(s => s.active);
+            
+            if (activeClusters.length === 0) {
+                clusterPriceLines.forEach((line) => candlestickSeries.removePriceLine(line));
+                clusterPriceLines.clear();
+                return;
+            }
+
+            const maxStrength = Math.max(...activeClusters.map(s => s.cluster.strength), 0.1);
+            const currentPrices = new Set();
+            
+            // Sort by strength (strongest first) and apply minimum distance filter
+            const sortedClusters = activeClusters
+                .map(s => s.cluster)
+                .sort((a, b) => b.strength - a.strength); // Sort by strength descending
+            
+            const filteredClusters = [];
+            const usedPrices = new Set();
+            const minDistancePct = 0.3; // Minimum 0.3% between clusters
+            
+            // Get current price for distance calculation
+            const currentPrice = currentData?.current_price || 90000;
+            
+            for (const cluster of sortedClusters) {
+                const price = cluster.price_level;
+                let tooClose = false;
+                
+                // Check if too close to already selected cluster
+                for (const usedPrice of usedPrices) {
+                    const distancePct = Math.abs(price - usedPrice) / currentPrice * 100;
+                    if (distancePct < minDistancePct) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                
+                if (!tooClose) {
+                    filteredClusters.push(cluster);
+                    usedPrices.add(price);
+                    currentPrices.add(price);
+                }
+            }
+            
+            console.log(`🎯 Rendering ${filteredClusters.length} filtered clusters (from ${sortedClusters.length} total)`);
+            
+            // Update or create price lines for filtered clusters
+            filteredClusters.forEach(cluster => {
+                const price = cluster.price_level;
+                let color = getClusterColor(cluster.strength, maxStrength);
+                let lineWidth = Math.max(1, Math.min(3, cluster.strength * 3)); // Thicker lines for stronger signals
+                let lineStyle = LightweightCharts.LineStyle.Solid;
+                
+                // Make very strong signals more prominent
+                if (cluster.strength >= 0.7) {
+                    lineWidth = 3;
+                }
+
+                const priceDecimals = getPriceDecimals(price);
+                const priceFormatted = formatPrice(price);
+                if (clusterPriceLines.has(price)) {
+                    clusterPriceLines.get(price).applyOptions({
+                        price, color, lineWidth, lineStyle,
+                        axisLabelVisible: true,
+                        title: `${cluster.side.toUpperCase()} @ $${priceFormatted} (${(cluster.strength * 100).toFixed(0)}%)`,
+                    });
+                } else {
+                    const priceLine = candlestickSeries.createPriceLine({
+                        price, color, lineWidth, lineStyle,
+                        axisLabelVisible: true,
+                        title: `${cluster.side.toUpperCase()} @ $${priceFormatted} (${(cluster.strength * 100).toFixed(0)}%)`,
+                    });
+                    clusterPriceLines.set(price, priceLine);
+                }
+            });
+
+            // Remove price lines for clusters that are no longer active or filtered out
+            clusterPriceLines.forEach((line, price) => {
+                if (!currentPrices.has(price)) {
+                    candlestickSeries.removePriceLine(line);
+                    clusterPriceLines.delete(price);
+                }
+            });
+        }
+
+        // Helper: add one TP or SL line (key must be unique per line)
+        function addTPOrSLLine(key, price, dir, isTP, reason) {
+            if (!price || price <= 0) return;
+            const isLong = dir === 'LONG';
+            const formatted = formatPrice(price);
+            const line = candlestickSeries.createPriceLine({
+                price,
+                color: isTP ? (isLong ? '#66bb6a' : '#ef5350') : (isLong ? '#ef5350' : '#66bb6a'),
+                lineWidth: 2,
+                lineStyle: isTP ? LightweightCharts.LineStyle.Dashed : LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: true,
+                title: `${dir} ${isTP ? 'TP' : 'SL'} @ $${formatted} (${reason})`,
+            });
+            tpTargetLines.set(key, line);
+        }
+
+        // Render TP and SL target lines for BOTH directions when we have level data
+        function renderTPTargets() {
+            if (!chart || !candlestickSeries || !currentTradingSignal) return;
+            
+            tpTargetLines.forEach((line) => candlestickSeries.removePriceLine(line));
+            tpTargetLines.clear();
+            
+            const signal = currentTradingSignal.signal;
+            const clusters = currentTradingSignal.clusters;
+            const sentiment = currentTradingSignal.sentiment;
+            const levels = currentTradingSignal.levels || {};
+            const currentPrice = currentTradingSignal.price || currentData?.current_price;
+            
+            if (!currentPrice) return;
+            
+            const signalLong = currentTradingSignal.signal_long || null;
+            const signalShort = currentTradingSignal.signal_short || null;
+
+            // ---- Primary signal (API best direction) ----
+            if (signal && signal.dir !== 'NEUTRAL' && (signal.tp || signal.sl)) {
+                const isLong = signal.dir === 'LONG';
+                let tpPrice = signal.tp;
+                let slPrice = signal.sl;
+                let tpReason = 'signal.tp';
+                let slReason = 'signal.sl';
+                
+                if (sentiment && sentiment.bias && clusters && clusters.best && clusters.best.dist !== undefined) {
+                    const biasMismatch = sentiment.bias !== signal.dir && sentiment.bias !== 'NEUTRAL' && signal.dir !== 'NEUTRAL';
+                    const distInRange = clusters.best.dist >= 0.4 && clusters.best.dist <= 1.0;
+                    if (biasMismatch && distInRange && clusters.best.price) {
+                        tpPrice = clusters.best.price;
+                        tpReason = 'bias mismatch → clusters.best.price (scalp)';
+                    }
+                }
+                if (clusters && clusters.best && clusters.best.side && clusters.best.price) {
+                    const clusterOpposesTrade = (isLong && clusters.best.side === 'short') || (!isLong && clusters.best.side === 'long');
+                    if (clusterOpposesTrade) {
+                        tpPrice = clusters.best.price;
+                        tpReason = 'hard TP → clusters.best.price (opposite side)';
+                    }
+                }
+                if (levels.support && levels.support.length > 0 && slPrice) {
+                    const nearestSupport = levels.support[0];
+                    if (Math.abs(slPrice - nearestSupport) / currentPrice * 100 < 0.5) {
+                        slPrice = nearestSupport * 0.999;
+                        slReason = 'confluence → 0.1% below support';
+                    }
+                }
+                if (sentiment && sentiment.oi && sentiment.oi < 0.5 && signal.sl) {
+                    const slDistance = Math.abs(currentPrice - signal.sl);
+                    slPrice = isLong ? currentPrice - slDistance * 1.25 : currentPrice + slDistance * 1.25;
+                    slReason = 'low OI → widened 25%';
+                }
+                
+                if (tpPrice && tpPrice > 0) addTPOrSLLine('primary_tp', tpPrice, signal.dir, true, tpReason);
+                if (slPrice && slPrice > 0) addTPOrSLLine('primary_sl', slPrice, signal.dir, false, slReason);
+            }
+            
+            // ---- LONG targets: show when we have signal_long or resistance (and not already primary LONG) ----
+            if ((!signal || signal.dir !== 'LONG') && (signalLong && signalLong.tp && signalLong.sl)) {
+                addTPOrSLLine('long_tp', signalLong.tp, 'LONG', true, 'signal_long.tp');
+                addTPOrSLLine('long_sl', signalLong.sl, 'LONG', false, 'signal_long.sl');
+            } else if ((!signal || signal.dir !== 'LONG') && levels.resistance && levels.resistance.length > 0) {
+                const res = levels.resistance[0];
+                addTPOrSLLine('long_tp', res * 1.005, 'LONG', true, 'levels.resistance (derived)');
+                addTPOrSLLine('long_sl', currentPrice * 0.98, 'LONG', false, 'signal.sl (derived)');
+            }
+            
+            // ---- SHORT targets: show when we have signal_short or support (and not already primary SHORT) ----
+            if ((!signal || signal.dir !== 'SHORT') && (signalShort && signalShort.tp && signalShort.sl)) {
+                addTPOrSLLine('short_tp', signalShort.tp, 'SHORT', true, 'signal_short.tp');
+                addTPOrSLLine('short_sl', signalShort.sl, 'SHORT', false, 'signal_short.sl');
+            } else if ((!signal || signal.dir !== 'SHORT') && levels.support && levels.support.length > 0) {
+                const sup = levels.support[0];
+                addTPOrSLLine('short_tp', sup * 0.995, 'SHORT', true, 'levels.support (derived)');
+                addTPOrSLLine('short_sl', currentPrice * 1.02, 'SHORT', false, 'signal.sl (derived)');
+            }
+        }
+
+        // Render heatmap with candlesticks
+        async function renderHeatmap(data) {
+            try {
+                const chartContainer = document.getElementById('chartContainer');
+                const loadingEl = document.getElementById('chartLoading');
+                
+                if (!data.clusters || data.clusters.length === 0) {
+                    if (loadingEl) loadingEl.style.display = 'block';
+                    if (chartContainer) {
+                        chartContainer.innerHTML = '<div style="color: #90a4ae; padding: 50px; text-align: center;">No clusters found. Waiting for data...</div>';
+                    }
+                    return;
+                }
+
+                if (loadingEl) loadingEl.style.display = 'none';
+                const currentPrice = data.current_price;
+                if (!currentPrice) {
+                    throw new Error('Current price not available');
+                }
+
+                // Get symbol from data or input field  
+                const symbol = data.symbol || currentSymbol || document.getElementById('symbolInput')?.value.toUpperCase() || 'BTCUSDT';
+                currentSymbol = symbol; // Update current symbol
+
+                // Initialize chart if needed
+                if (!chart || !candlestickSeries) {
+                    const initialized = initChart();
+                    if (!initialized) {
+                        throw new Error('Failed to initialize chart');
+                    }
+                }
+                
+                // Clear old TP lines when switching symbols
+                tpTargetLines.forEach((line) => {
+                    if (candlestickSeries) candlestickSeries.removePriceLine(line);
+                });
+                tpTargetLines.clear();
+
+                // Double-check that series exists
+                if (!candlestickSeries) {
+                    throw new Error('Candlestick series not initialized');
+                }
+
+                const now = Math.floor(Date.now() / 1000);
+                const maxStrength = Math.max(...data.clusters.map(c => c.strength), 0.1);
+
+                // Update cluster states
+                data.clusters.forEach(cluster => {
+                    const price = cluster.price_level;
+                    if (!clusterStates.has(price)) {
+                        clusterStates.set(price, {
+                            cluster, active: true, firstSeen: now, lastSeen: now,
+                        });
+                    } else {
+                        const state = clusterStates.get(price);
+                        state.cluster = cluster;
+                        state.lastSeen = now;
+                    }
+                });
+
+                const currentPrices = new Set(data.clusters.map(c => c.price_level));
+                clusterStates.forEach((state, price) => {
+                    if (!currentPrices.has(price) && state.active) {
+                        state.active = false;
+                        state.lastSeen = now;
+                    }
+                });
+
+                // Get current timeframe
+                const timeframe = document.getElementById('timeframeSelect')?.value || currentTimeframe || '1h';
+                
+                // Determine number of bars based on timeframe
+                const barsMap = {
+                    '1m': 500, '3m': 300, '5m': 200, '15m': 200, '30m': 200,
+                    '1h': 200, '2h': 150, '4h': 150, '6h': 100, '8h': 100,
+                    '12h': 100, '1d': 100, '3d': 60, '1w': 52
+                };
+                const bars = barsMap[timeframe] || 200;
+                
+                // Apply signal quality filter
+                const signalQuality = document.getElementById('signalQuality')?.value || 'all';
+                let filteredClusters = data.clusters;
+                if (signalQuality === 'high') {
+                    // Filter: strength >= 0.3 OR open_interest >= $1M
+                    filteredClusters = data.clusters.filter(c => 
+                        c.strength >= 0.3 || c.total_notional >= 1000000
+                    );
+                } else if (signalQuality === 'very_high') {
+                    // Filter: strength >= 0.5 AND open_interest >= $2M
+                    filteredClusters = data.clusters.filter(c => 
+                        c.strength >= 0.5 && c.total_notional >= 2000000
+                    );
+                }
+                
+                // Update data with filtered clusters
+                data.clusters = filteredClusters;
+                data.total_clusters = filteredClusters.length;
+                
+                console.log(`📊 Filtered to ${filteredClusters.length} high-quality signals (from ${data.clusters.length + filteredClusters.length - data.total_clusters} total)`);
+
+                // Fetch REAL OHLC data from Binance
+                console.log(`📊 Fetching real OHLC data for ${symbol} at ${timeframe} timeframe (${bars} bars)...`);
+                const ohlcData = await fetchBinanceOHLC(symbol, timeframe, bars);
+                candlestickSeries.setData(ohlcData);
+
+                const latestCandle = ohlcData[ohlcData.length - 1];
+                checkClusterCollisions(currentPrice, latestCandle.high, latestCandle.low);
+                renderHeatmapBands();
+                renderTPTargets();
+                
+                // Ensure current price is visible in the data by updating the latest candle
+                if (currentPrice > 0 && latestCandle) {
+                    // Update latest candle to include current price in range
+                    const updatedCandle = {
+                        ...latestCandle,
+                        high: Math.max(latestCandle.high, currentPrice),
+                        low: Math.min(latestCandle.low, currentPrice),
+                        close: currentPrice,
+                    };
+                    candlestickSeries.update(updatedCandle);
+                }
+                
+                // Center chart on time scale
+                chart.timeScale().fitContent();
+                
+                // Configure price scale to auto-scale with margins (ensures current price is visible)
+                chart.priceScale('right').applyOptions({
+                    autoScale: true,
+                    scaleMargins: {
+                        top: 0.1,  // 10% padding at top
+                        bottom: 0.1,  // 10% padding at bottom
+                    },
+                });
+                
+                console.log(`📊 Chart configured for ${symbol} - Current price: $${formatPrice(currentPrice)}`);
+            } catch (error) {
+                console.error('Error rendering heatmap:', error);
+                const chartContainer = document.getElementById('chartContainer');
+                if (chartContainer) {
+                    chartContainer.innerHTML = `<div class="error" style="color: #ef5350; padding: 20px; text-align: center;">Error rendering chart: ${error.message}</div>`;
+                }
+                throw error;
+            }
+        }
+
+        // Start real-time price updates
+        function startPriceUpdates() {
+            if (priceUpdateInterval) return;
+            priceUpdateInterval = setInterval(async () => {
+                try {
+                    const symbol = document.getElementById('symbolInput').value.toUpperCase() || currentSymbol;
+                    const response = await fetch(`${API_BASE}/api/heatmap/${symbol}`);
+                    const data = await response.json();
+
+                    if (data.success && data.current_price) {
+                        const now = Math.floor(Date.now() / 1000);
+                        const currentPrice = data.current_price;
+                        
+                        // Get timeframe and calculate current candle time
+                        const timeframe = document.getElementById('timeframeSelect')?.value || currentTimeframe || '1h';
+                        const timeframeSeconds = getTimeframeSeconds(timeframe);
+                        const currentCandleTime = Math.floor(now / timeframeSeconds) * timeframeSeconds;
+                        
+                        const lastCandle = candlestickSeries.data().slice(-1)[0];
+                        
+                        if (lastCandle && lastCandle.time === currentCandleTime) {
+                            // Update current candle
+                            candlestickSeries.update({
+                                ...lastCandle,
+                                close: currentPrice,
+                                high: Math.max(lastCandle.high, currentPrice),
+                                low: Math.min(lastCandle.low, currentPrice),
+                            });
+                        } else {
+                            // Create new candle
+                            candlestickSeries.update({
+                                time: currentCandleTime,
+                                open: lastCandle ? lastCandle.close : currentPrice,
+                                high: currentPrice,
+                                low: currentPrice,
+                                close: currentPrice,
+                            });
+                        }
+
+                        const latestCandle = candlestickSeries.data().slice(-1)[0];
+                        if (latestCandle) {
+                            if (checkClusterCollisions(currentPrice, latestCandle.high, latestCandle.low)) {
+                                renderHeatmapBands();
+                            }
+                            // Update TP targets if signal changes
+                            renderTPTargets();
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error updating price:', error);
+                }
+            }, 1000);
+        }
+
+        function stopPriceUpdates() {
+            if (priceUpdateInterval) {
+                clearInterval(priceUpdateInterval);
+                priceUpdateInterval = null;
+            }
+        }
+
+        // Show cluster info
+        function showClusterInfo(cluster) {
+            const info = document.getElementById('clusterInfo');
+            const priceDecimals = getPriceDecimals(cluster.price_level);
+            document.getElementById('clusterPrice').textContent = `$${formatPrice(cluster.price_level)}`;
+            document.getElementById('clusterSide').textContent = cluster.side.toUpperCase();
+            document.getElementById('clusterStrength').textContent = cluster.strength.toFixed(2);
+            document.getElementById('clusterStrengthBar').style.width = `${cluster.strength * 100}%`;
+            document.getElementById('clusterCount').textContent = cluster.liquidation_count.toLocaleString();
+            document.getElementById('clusterNotional').textContent = `$${cluster.total_notional.toLocaleString(undefined, {maximumFractionDigits: 0})}`;
+            document.getElementById('clusterDistance').textContent = `${cluster.distance_from_price.toFixed(2)}%`;
+            info.classList.add('show');
+        }
+
+        // Update statistics
+        function updateStats(data) {
+            if (data.current_price) {
+                const priceFormatted = formatPrice(data.current_price);
+                document.getElementById('currentPrice').textContent = `$${priceFormatted}`;
+            } else {
+                document.getElementById('currentPrice').textContent = '-';
+            }
+            document.getElementById('totalClusters').textContent = data.total_clusters;
+            
+            const longClusters = data.clusters.filter(c => c.side === 'long').length;
+            const shortClusters = data.clusters.filter(c => c.side === 'short').length;
+            
+            document.getElementById('longClusters').textContent = longClusters;
+            document.getElementById('shortClusters').textContent = shortClusters;
+        }
+
+        // Toggle auto refresh
+        function toggleAutoRefresh() {
+            autoRefreshEnabled = !autoRefreshEnabled;
+            const btn = document.getElementById('autoRefreshBtn');
+            
+            if (autoRefreshEnabled) {
+                btn.textContent = 'Auto Refresh: ON (3s)';
+                btn.style.background = 'linear-gradient(135deg, #66bb6a 0%, #43a047 100%)';
+                autoRefreshInterval = setInterval(loadHeatmap, 3000); // Refresh every 3 seconds (matches backend level recalc)
+                startPriceUpdates(); // Also start real-time price updates
+            } else {
+                btn.textContent = 'Auto Refresh: OFF';
+                btn.style.background = 'linear-gradient(135deg, #4fc3f7 0%, #29b6f6 100%)';
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                    autoRefreshInterval = null;
+                }
+                stopPriceUpdates();
+            }
+        }
+
+        // Load LightweightCharts library dynamically
+        function loadLightweightCharts() {
+            return new Promise((resolve, reject) => {
+                // Check if already loaded
+                if (typeof LightweightCharts !== 'undefined') {
+                    console.log('LightweightCharts already loaded');
+                    resolve(true);
+                    return;
+                }
+
+                // Create script element - try v4 first (more stable API)
+                const script = document.createElement('script');
+                // Use v4.1.3 which has addCandlestickSeries method
+                script.src = 'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js';
+                script.async = true;
+                
+                script.onload = () => {
+                    console.log('LightweightCharts script loaded');
+                    // Wait a bit for the library to initialize
+                    setTimeout(() => {
+                        if (typeof LightweightCharts !== 'undefined') {
+                            console.log('LightweightCharts is available');
+                            resolve(true);
+                        } else {
+                            console.error('LightweightCharts not available after script load');
+                            reject(new Error('LightweightCharts not available'));
+                        }
+                    }, 100);
+                };
+                
+                script.onerror = () => {
+                    console.error('Failed to load LightweightCharts script');
+                    reject(new Error('Failed to load LightweightCharts script'));
+                };
+                
+                document.head.appendChild(script);
+            });
+        }
+
+        // Wait for LightweightCharts to load (fallback for if already in DOM)
+        function waitForLightweightCharts(callback, maxAttempts = 50) {
+            let attempts = 0;
+            const checkInterval = setInterval(() => {
+                attempts++;
+                if (typeof LightweightCharts !== 'undefined' && typeof LightweightCharts.createChart === 'function') {
+                    clearInterval(checkInterval);
+                    callback(true);
+                } else if (attempts >= maxAttempts) {
+                    clearInterval(checkInterval);
+                    console.error('LightweightCharts library failed to load after 5 seconds');
+                    callback(false);
+                }
+            }, 100);
+        }
+
+        // Initialize on page load
+        window.addEventListener('DOMContentLoaded', async () => {
+            loadSymbols();
+            
+            try {
+                // Load library dynamically
+                await loadLightweightCharts();
+                
+                // Wait a bit more to ensure everything is ready
+                await new Promise(resolve => setTimeout(resolve, 200));
+                
+                // Initialize chart
+                const initialized = initChart();
+                if (initialized) {
+                    // Load initial data after chart is ready
+                    setTimeout(() => loadHeatmap(), 300);
+                } else {
+                    console.error('Chart initialization failed on page load');
+                    const chartContainer = document.getElementById('chartContainer');
+                    if (chartContainer) {
+                        chartContainer.innerHTML = '<div style="color: #ef5350; padding: 20px; text-align: center;">Failed to initialize chart. Check console for details.</div>';
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to load charting library:', error);
+                const chartContainer = document.getElementById('chartContainer');
+                if (chartContainer) {
+                    chartContainer.innerHTML = `<div style="color: #ef5350; padding: 20px; text-align: center;">Failed to load charting library: ${error.message}<br><small>Please check your internet connection and refresh.</small></div>`;
+                }
+            }
+        });
+
+        // Allow Enter key to load
+        document.getElementById('symbolInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                loadHeatmap();
+            }
+        });
+
+        // Handle timeframe change
+        document.getElementById('timeframeSelect').addEventListener('change', (e) => {
+            if (chart && candlestickSeries && currentData) {
+                // Reload heatmap with new timeframe
+                loadHeatmap();
+            }
+        });
+    </script>
+</body>
+</html>
