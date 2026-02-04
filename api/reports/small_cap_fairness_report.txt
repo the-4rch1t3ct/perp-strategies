@@ -1,0 +1,36 @@
+======================================================================
+SMALL-CAP FAIRNESS REPORT (after smooth OI + relative threshold)
+======================================================================
+Generated after API restart with:
+  - Smooth relative strength (no hard $1M OI cutoff; curve from $50k–$10M)
+  - Hybrid weights 20% base / 80% relative
+  - Dynamic heatmap OI floor: max($25k, 2% of symbol total OI)
+
+OI tier          Symbols    Str≥0.5    Non-NEUTRAL
+----------------------------------------------------------------------
+<$1M             6          5          0
+$1M–$10M         17         17         0
+$10M–$100M       13         13         0
+>$100M           5          5          0
+unknown          4          0          0
+
+Totals: 45 symbols, 40 with strength≥0.5, 0 with active signal.
+
+Notes:
+  - Str≥0.5: symbols whose best cluster strength meets min_strength (0.50).
+  - Non-NEUTRAL: symbols with LONG/SHORT signal (after RR/trend/TP filters).
+  - Before the change: all symbols with OI < $1M had relative_strength=0, so
+    hybrid strength was only 20% of base (market share) and almost none
+    reached 0.50. Now 5 of 6 small-cap symbols reach Str≥0.5.
+
+Small-cap (<$1M OI) symbols and strength:
+  ALGOUSDT       str=0.60  dir=NEUTRAL  OI≈$981k
+  COMPUSDT       str=0.60  dir=NEUTRAL  OI≈$653k
+  GMXUSDT        str=0.50  dir=NEUTRAL  OI≈$289k
+  SNXUSDT        str=0.50  dir=NEUTRAL  OI≈$460k
+  SUPERUSDT      str=0.50  dir=NEUTRAL  OI≈$445k
+  TNSRUSDT       str=0.40  dir=NEUTRAL  OI≈$162k
+
+(TNSRUSDT remains just below 0.50 at very low OI; others now qualify.)
+
+======================================================================

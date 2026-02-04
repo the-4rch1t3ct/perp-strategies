@@ -61,7 +61,8 @@ class PredictiveLiquidationHeatmap:
     def __init__(self,
                  leverage_tiers: List[float] = None,
                  price_bucket_pct: float = 0.005,  # 0.5% buckets (increased to reduce noise)
-                 min_oi_threshold: float = 500000,  # Minimum OI to show (USD) - increased for quality
+                 min_oi_threshold: float = 25000,  # Absolute OI floor (USD) to show
+                 min_oi_threshold_pct: float = 0.02,  # Relative OI floor (% of total OI)
                  min_cluster_distance_pct: float = 0.3,  # Minimum distance between clusters (%)
                  update_interval: float = 5.0):
         """
@@ -71,11 +72,13 @@ class PredictiveLiquidationHeatmap:
             leverage_tiers: List of leverage levels to calculate (e.g., [100, 50, 25, 10])
             price_bucket_pct: Price bucket size for clustering (%)
             min_oi_threshold: Minimum Open Interest to display (USD)
+            min_oi_threshold_pct: Minimum OI per tier as % of total OI
             update_interval: Seconds between updates
         """
         self.leverage_tiers = leverage_tiers or [100, 50, 25, 10, 5]
         self.price_bucket_pct = price_bucket_pct
         self.min_oi_threshold = min_oi_threshold
+        self.min_oi_threshold_pct = min_oi_threshold_pct
         self.min_cluster_distance_pct = min_cluster_distance_pct
         self.update_interval = update_interval
         
@@ -288,6 +291,10 @@ class PredictiveLiquidationHeatmap:
         for lev in leverage_weights:
             leverage_weights[lev] /= total_weight
         
+        # Dynamic OI floor: absolute minimum + % of total OI
+        total_oi_usd = oi_data.get('total_oi_usd', 0.0) or 0.0
+        dynamic_min_oi = max(self.min_oi_threshold, total_oi_usd * self.min_oi_threshold_pct)
+        
         # Calculate levels for each leverage tier
         for leverage in self.leverage_tiers:
             weight = leverage_weights[leverage]
@@ -300,7 +307,7 @@ class PredictiveLiquidationHeatmap:
             # Distribute OI based on weight
             oi_per_tier = oi_data['long_oi_usd'] * weight
             
-            if oi_per_tier >= self.min_oi_threshold:
+            if oi_per_tier >= dynamic_min_oi:
                 max_oi = oi_data['total_oi_usd']
                 strength = _strength_from_oi_fraction(oi_per_tier, max_oi)
                 
@@ -329,7 +336,7 @@ class PredictiveLiquidationHeatmap:
             
             oi_per_tier = oi_data['short_oi_usd'] * weight
             
-            if oi_per_tier >= self.min_oi_threshold:
+            if oi_per_tier >= dynamic_min_oi:
                 max_oi = oi_data['total_oi_usd']
                 strength = _strength_from_oi_fraction(oi_per_tier, max_oi)
                 

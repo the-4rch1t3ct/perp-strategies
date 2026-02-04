@@ -20,9 +20,13 @@ from pydantic import BaseModel
 from typing import Dict, List, Optional
 from datetime import datetime
 import asyncio
+import logging
 import threading
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
 from fastapi import Body
 
 # Import predictive heatmap (replaces post-mortem approach)
@@ -35,12 +39,6 @@ except ImportError:
     SUPPORTED_SYMBOLS_HL = []
     SYMBOL_TO_COIN = {}
     _enhanced_confidence_score = None
-
-# Aster batch (same response shape, Aster DEX data source)
-try:
-    from aster_batch import fetch_aster_batch_data
-except ImportError:
-    fetch_aster_batch_data = None
 
 app = FastAPI(title="Liquidation Heatmap API")
 
@@ -94,7 +92,7 @@ SUPPORTED_SYMBOLS = [
     'BCHUSDT',   # Bitcoin Cash
     'LINKUSDT',  # Chainlink
     'XMRUSDT',   # Monero
-    'ASTERUSDT', 'HYPEUSDT', 'SUIUSDT', 'PUMPUSDT',  # for Aster batch (Binance/HL clusters)
+    'ASTERUSDT', 'HYPEUSDT', 'SUIUSDT', 'PUMPUSDT',  # HL/Binance clusters
     # Tier 1 - High Liquidity, Major Coins
     'BTCUSDT',   # Bitcoin
     'MATICUSDT', # Polygon
@@ -114,18 +112,18 @@ SUPPORTED_SYMBOLS = [
     # Tier 5 - High-Volume Meme Coins
     'PEPEUSDT',  # Pepe
     'WIFUSDT',   # dogwifhat
-    'MYROUSDT',  # Myro
     # Batch 2 - Additional High-Quality Assets (21 more to reach 50)
     # Tier 1 - Major Coins
     'ETCUSDT',   # Ethereum Classic
     'ALGOUSDT',  # Algorand
     'NEARUSDT',  # NEAR Protocol
-    'FTMUSDT',   # Fantom
     'ICPUSDT',   # Internet Computer
+    'FILUSDT',   # Filecoin (replaces FTM - not available for perp)
+    'JTOUSDT',   # Jupiter (replaces MYRO - not available for perp)
+    'RUNEUSDT',  # THORChain (replaces MKR - not available for perp)
     # Tier 2 - DeFi Tokens
     'AAVEUSDT',  # Aave
     'COMPUSDT',  # Compound
-    'MKRUSDT',   # Maker
     'CRVUSDT',   # Curve
     'SNXUSDT',   # Synthetix
     'GMXUSDT',   # GMX
@@ -178,7 +176,8 @@ def initialize_heatmap():
             heatmap = PredictiveLiquidationHeatmap(
                 leverage_tiers=[100, 50, 25, 10, 5],  # Common leverage levels
                 price_bucket_pct=0.005,  # 0.5% price buckets (reduced noise)
-                min_oi_threshold=500000,  # Minimum $500k OI to show (higher quality)
+                min_oi_threshold=25000,  # Absolute OI floor (USD)
+                min_oi_threshold_pct=0.02,  # Relative OI floor (% of total OI)
                 min_cluster_distance_pct=0.3,  # Minimum 0.3% distance between clusters
                 update_interval=3.0  # Recalc levels every 3s (uses cached prices/OI)
             )
@@ -197,6 +196,18 @@ def initialize_heatmap():
 @app.on_event("startup")
 async def startup_event():
     initialize_heatmap()
+    # Rolling trend refresh: keep TREND_CACHE warm in sync with batch updates (one batch every 5s).
+    threading.Thread(target=_rolling_trend_refresh_worker, daemon=True).start()
+    # Parallel warmup: fill trend cache for first 2 batches so first request is fast (trend is mandatory).
+    def _parallel_warm_trend():
+        batches = [SUPPORTED_SYMBOLS[i:i + BATCH_SIZE] for i in range(0, len(SUPPORTED_SYMBOLS), BATCH_SIZE)]
+        warm_symbols = []
+        for b in batches[:2]:  # first 2 batches
+            warm_symbols.extend(b)
+        with ThreadPoolExecutor(max_workers=TREND_ROLLING_WORKERS) as ex:
+            for _ in ex.map(get_mtf_trend, warm_symbols):
+                pass
+    threading.Thread(target=_parallel_warm_trend, daemon=True).start()
     print("🚀 Predictive Liquidation Heatmap API started")
     print("   Showing RISK ZONES before liquidations occur")
 
@@ -420,7 +431,10 @@ async def get_trading_signal(
         long_clusters_below.sort(key=lambda x: x.strength, reverse=True)
         short_clusters_above.sort(key=lambda x: x.strength, reverse=True)
         
-        # Strategy: Trade towards strongest cluster
+        # Strategy: Trade towards strongest cluster (SL aligned with trader: ATR-based dynamic)
+        sl_pct = _sl_pct_for_rr(symbol, current_price)
+        if sl_pct <= 0:
+            sl_pct = ESTIMATED_SL_PCT
         signal_data = None
         cluster_data = None
         
@@ -431,8 +445,8 @@ async def get_trading_signal(
             if distance < max_distance:
                 # Enter LONG, target short liquidation cluster
                 entry = current_price
-                stop_loss = current_price * 0.98  # 2% stop
-                take_profit = strongest_short.price_level * (1 + TP_CLUSTER_OFFSET_PCT / 100.0)  # TP above cluster (targeting short liquidations)  # Just below cluster
+                stop_loss = current_price * (1 - sl_pct / 100.0)
+                take_profit = strongest_short.price_level * (1 + TP_CLUSTER_OFFSET_PCT / 100.0)  # TP above cluster (targeting short liquidations)
                 
                 risk = entry - stop_loss
                 reward = take_profit - entry
@@ -463,8 +477,8 @@ async def get_trading_signal(
             if distance < max_distance:
                 # Enter SHORT, target long liquidation cluster
                 entry = current_price
-                stop_loss = current_price * 1.02  # 2% stop
-                take_profit = strongest_long.price_level * (1 - TP_CLUSTER_OFFSET_PCT / 100.0)  # TP below cluster (targeting long liquidations)  # Just above cluster
+                stop_loss = current_price * (1 + sl_pct / 100.0)
+                take_profit = strongest_long.price_level * (1 - TP_CLUSTER_OFFSET_PCT / 100.0)  # TP below cluster (targeting long liquidations)
                 
                 risk = stop_loss - entry
                 reward = entry - take_profit
@@ -599,14 +613,15 @@ async def get_market_sentiment(symbol: str):
         long_oi = oi_data.get('long_oi_usd', 0)
         short_oi = oi_data.get('short_oi_usd', 0)
         
-        # Determine sentiment
-        if long_short_ratio > 1.2:
+        # Determine sentiment (adaptive thresholds based on funding trend strength)
+        bull, bear, bull_high, bear_high = _sentiment_thresholds(oi_data)
+        if long_short_ratio > bull:
             sentiment = "BULLISH_BIAS"
-            bias_strength = "HIGH" if long_short_ratio > 1.5 else "MODERATE"
+            bias_strength = "HIGH" if long_short_ratio > bull_high else "MODERATE"
             interpretation = f"More long positions ({long_short_ratio:.2f}:1) - Short liquidations more likely on price rise"
-        elif long_short_ratio < 0.8:
+        elif long_short_ratio < bear:
             sentiment = "BEARISH_BIAS"
-            bias_strength = "HIGH" if long_short_ratio < 0.67 else "MODERATE"
+            bias_strength = "HIGH" if long_short_ratio < bear_high else "MODERATE"
             interpretation = f"More short positions ({1/long_short_ratio:.2f}:1) - Long liquidations more likely on price fall"
         else:
             sentiment = "NEUTRAL"
@@ -659,19 +674,70 @@ class BatchTradeResponse(BaseModel):
     data_age_ms: Optional[int] = None  # Age of Hyperliquid data in milliseconds (for freshness tracking)
 
 # Reject signals where TP is too close to entry (poor cluster data, not a real setup)
-MIN_TP_DISTANCE_PCT = 0.3  # Lowered from 0.5% because Hyperliquid clusters are naturally close to mark price. 0.3% ensures TP is meaningful while allowing close clusters.
+# HL impact levels are often 0.1–0.5% away; 0.25% minimum TP distance allows direction signals while filtering noise
+MIN_TP_DISTANCE_PCT = 0.25
 TP_CLUSTER_OFFSET_PCT = 0.3  # take profit just before/after cluster
 # Minimum distance from current price for cluster to be actionable
-# Set to 0.0 because MIN_TP_DISTANCE_PCT (0.5%) provides sufficient filtering
-# Clusters very close to price will fail TP distance check anyway
-# This allows Hyperliquid's naturally close impact prices to generate signals
 MIN_CLUSTER_DISTANCE_PCT = 0.0
 
+# Minimum risk:reward to emit LONG/SHORT (below this we return NEUTRAL). HL impact clusters are often close;
+# 0.35 allows trend-aligned signals from close clusters while filtering very poor RR.
+MIN_RR_FOR_SIGNAL = 0.35
+
 # Stop Loss estimation for RR calculation
-# Note: Trader uses ATR-based SL (dynamic, typically 1-3% depending on volatility)
-# We use 1.5% as a realistic estimate (middle of typical ATR range)
-# This ensures RR calculation is closer to what trader will actually use
 ESTIMATED_SL_PCT = 1.5  # Estimated SL % for RR calculation (matches trader's ATR-based approach)
+
+# Adaptive sentiment bands (use funding trend strength when available)
+SENTIMENT_BASE_DEVIATION = 0.20
+SENTIMENT_MIN_DEVIATION = 0.06
+SENTIMENT_HIGH_MULTIPLIER = 1.5
+
+def _round_price(price: float) -> float:
+    """
+    Round price with appropriate precision based on price level.
+    Matches Hyperliquid exchange precision to avoid losing significant digits.
+    - Price >= 100: 2 decimals (e.g., ETH: 2263.7, BTC: 77330.0)
+    - Price >= 10: 2 decimals (e.g., SOL: 101.03)
+    - Price >= 1: 4 decimals (e.g., XRP: 1.5871, LINK: 9.5444)
+    - Price >= 0.1: 5 decimals (e.g., TRX: 0.28262, DOGE: 0.10629, ADA: 0.29528)
+    - Price >= 0.01: 5 decimals (e.g., TNSR: 0.04856)
+    - Price >= 0.001: 6 decimals (e.g., MYRO: 0.015813, SEI: 0.087675)
+    - Price < 0.001: 7 decimals (e.g., PUMP: 0.00238)
+    """
+    if not price or price <= 0:
+        return 0.0
+    
+    if price >= 100.0:
+        return round(price, 2)  # High-value coins: 2 decimals
+    elif price >= 10.0:
+        return round(price, 2)  # Mid-value coins: 2 decimals
+    elif price >= 1.0:
+        return round(price, 4)  # Low-value coins: 4 decimals (XRP, LINK, etc.)
+    elif price >= 0.1:
+        return round(price, 5)  # Very low-value coins: 5 decimals (TRX, DOGE, ADA)
+    elif price >= 0.01:
+        return round(price, 5)  # Micro coins: 5 decimals (TNSR)
+    elif price >= 0.001:
+        return round(price, 6)  # Nano coins: 6 decimals (MYRO, SEI)
+    else:
+        return round(price, 7)  # Pico coins: 7 decimals
+
+
+def _sentiment_thresholds(oi_data: Dict) -> tuple:
+    """Return (bull, bear, bull_high, bear_high) thresholds for sentiment."""
+    trend_strength = 0.0
+    if isinstance(oi_data, dict):
+        ts = oi_data.get("funding_trend_strength")
+        if isinstance(ts, (int, float)):
+            trend_strength = max(0.0, min(1.0, float(ts)))
+    deviation = SENTIMENT_BASE_DEVIATION - (
+        (SENTIMENT_BASE_DEVIATION - SENTIMENT_MIN_DEVIATION) * trend_strength
+    )
+    bull = 1.0 + deviation
+    bear = 1.0 - deviation
+    bull_high = 1.0 + (deviation * SENTIMENT_HIGH_MULTIPLIER)
+    bear_high = 1.0 - (deviation * SENTIMENT_HIGH_MULTIPLIER)
+    return bull, bear, bull_high, bear_high
 
 # Multi-timeframe trend filter (fast confirmation for short-horizon entries)
 TREND_FILTER_ENABLED = True
@@ -681,12 +747,25 @@ TREND_EMA_FAST = 9
 TREND_EMA_SLOW = 21
 TREND_NEUTRAL_BAND_PCT = 0.05  # % diff between EMAs to consider a trend
 TREND_CACHE_TTL_SEC = 55
+TREND_STALE_FALLBACK_SEC = 6 * 3600  # allow stale trend fallback when live fetch fails
+TREND_WARMUP_DELAY_SEC = 0.05  # small delay to avoid bursty warmup calls
+TREND_WARN_COOLDOWN_SEC = 60  # min seconds between same-symbol trend failure warnings
+# Rolling trend refresh: same cycle as batch cache so trend is always warm when batch is served
+TREND_ROLLING_INTERVAL_SEC = BATCH_CACHE_TTL  # refresh one batch of trends every 5s
+TREND_ROLLING_WORKERS = 4  # parallel workers for trend refresh (avoid rate-limit spike)
 BINANCE_FAPI_URL = "https://fapi.binance.com"
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+ATR_CACHE = {}
+ATR_CACHE_TTL_SEC = 55
+ATR_INTERVAL = "5m"
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 1.5
+ATR_FALLBACK_PCT = 0.02
+SL_BUFFER_PCT = 0.001
 
 
 def _levels_with_distance_for_price(levels: List[LiquidationLevel], current_price: float) -> List[LiquidationLevel]:
-    """Recompute distance_from_price for each level using current_price (e.g. Aster price when levels are from Binance/HL)."""
+    """Recompute distance_from_price for each level using current_price (e.g. when levels are from Binance/HL)."""
     if not levels or not current_price or current_price <= 0:
         return levels
     from dataclasses import replace
@@ -752,20 +831,154 @@ def _fetch_klines_hyperliquid(symbol: str, interval: str, limit: int = 120) -> L
         response.raise_for_status()
         data = response.json()
         if isinstance(data, list) and data:
-            closes = []
+            # HL format: {"t": start_time, "c": close, ...}; sort by t for chronological order (EMA needs oldest-first)
+            pairs = []
             for candle in data:
                 try:
-                    # Hyperliquid format: {"t": start_time, "T": end_time, "s": symbol, "i": interval, "o": open, "h": high, "l": low, "c": close, "v": volume, "n": trades}
-                    close_price = candle.get("c")
-                    if close_price:
-                        closes.append(float(close_price))
-                except Exception:
+                    t = candle.get("t")
+                    c = candle.get("c")
+                    if t is not None and c is not None:
+                        pairs.append((int(t), float(c)))
+                except (TypeError, ValueError):
                     continue
-            if closes:
-                return closes
+            if pairs:
+                pairs.sort(key=lambda x: x[0])
+                return [c for _t, c in pairs]
     except Exception:
         pass
     return []
+
+# Cache for OHLC to avoid redundant ATR calls
+def _fetch_ohlc_hyperliquid(symbol: str, interval: str, limit: int = 120) -> List[tuple]:
+    """Fetch OHLC tuples from Hyperliquid (prioritized for trading venue)."""
+    if not SYMBOL_TO_COIN:
+        return []
+    coin = SYMBOL_TO_COIN.get(symbol)
+    if not coin:
+        return []
+
+    interval_map = {
+        "1m": "1m", "5m": "5m", "15m": "15m",
+        "1h": "1h", "4h": "4h", "1d": "1d"
+    }
+    hl_interval = interval_map.get(interval)
+    if not hl_interval:
+        return []
+
+    try:
+        end_time_ms = int(time.time() * 1000)
+        ms_per_candle = {
+            "1m": 60000, "5m": 300000, "15m": 900000,
+            "1h": 3600000, "4h": 14400000, "1d": 86400000
+        }
+        ms_per = ms_per_candle.get(hl_interval, 60000)
+        start_time_ms = end_time_ms - (limit * ms_per)
+        response = requests.post(
+            HYPERLIQUID_INFO_URL,
+            json={
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": coin,
+                    "interval": hl_interval,
+                    "startTime": start_time_ms,
+                    "endTime": end_time_ms
+                }
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and data:
+            rows = []
+            for candle in data:
+                try:
+                    t = candle.get("t")
+                    h = candle.get("h")
+                    l = candle.get("l")
+                    c = candle.get("c")
+                    if None not in (t, h, l, c):
+                        rows.append((int(t), float(h), float(l), float(c)))
+                except (TypeError, ValueError):
+                    continue
+            if rows:
+                rows.sort(key=lambda x: x[0])
+                return [(h, l, c) for _t, h, l, c in rows]
+    except Exception:
+        pass
+    return []
+
+
+def _fetch_ohlc(symbol: str, interval: str, limit: int = 120) -> List[tuple]:
+    """Fetch OHLC tuples: try Hyperliquid first, fallback to Binance."""
+    time.sleep(HYPERLIQUID_CANDLE_THROTTLE_DELAY)
+    ohlc = _fetch_ohlc_hyperliquid(symbol, interval, limit)
+    if ohlc:
+        return ohlc
+    for endpoint in ["/fapi/v1/klines", "/fapi/v3/klines"]:
+        try:
+            response = requests.get(
+                f"{BINANCE_FAPI_URL}{endpoint}",
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=3
+            )
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list) and data:
+                rows = []
+                for k in data:
+                    try:
+                        rows.append((float(k[2]), float(k[3]), float(k[4])))
+                    except Exception:
+                        continue
+                if rows:
+                    return rows
+        except Exception:
+            continue
+    return []
+
+
+def _compute_atr(ohlc: List[tuple], period: int) -> Optional[float]:
+    if not ohlc or len(ohlc) < period + 1:
+        return None
+    trs = []
+    prev_close = None
+    for h, l, c in ohlc:
+        if prev_close is None:
+            tr = h - l
+        else:
+            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        prev_close = c
+    if len(trs) < period:
+        return None
+    return sum(trs[-period:]) / period
+
+
+def _get_atr(symbol: str) -> Optional[float]:
+    now = time.time()
+    cached = ATR_CACHE.get(symbol)
+    if cached and (now - cached.get("ts", 0)) < ATR_CACHE_TTL_SEC:
+        return cached.get("atr")
+    ohlc = _fetch_ohlc(symbol, ATR_INTERVAL, ATR_PERIOD + 10)
+    atr = _compute_atr(ohlc, ATR_PERIOD)
+    ATR_CACHE[symbol] = {"atr": atr, "ts": now}
+    return atr
+
+
+def _sl_pct_for_rr(symbol: Optional[str], entry_price: float) -> float:
+    if not symbol or not entry_price or entry_price <= 0:
+        return 0.0
+    atr = _get_atr(symbol)
+    if (atr is None or atr <= 0) and ATR_FALLBACK_PCT and ATR_FALLBACK_PCT > 0:
+        atr = entry_price * ATR_FALLBACK_PCT
+    if not atr or atr <= 0:
+        return 0.0
+    sl_dist = atr * ATR_MULTIPLIER
+    sl_pct = (sl_dist / entry_price) * 100.0
+    if SL_BUFFER_PCT and SL_BUFFER_PCT > 0:
+        sl_pct += SL_BUFFER_PCT * 100.0
+    return sl_pct
 
 # Cache for klines to avoid redundant API calls
 KLINES_CACHE = {}
@@ -829,6 +1042,42 @@ def _trend_dir_from_closes(closes: List[float]) -> tuple:
         return 0, diff_pct
     return (1 if diff_pct > 0 else -1), diff_pct
 
+def _mark_stale_trend(data: Dict, age_sec: float) -> Dict:
+    """Annotate trend data as stale for downstream visibility."""
+    if not isinstance(data, dict):
+        return data
+    out = dict(data)
+    out["_stale"] = True
+    out["_stale_age_sec"] = int(age_sec)
+    return out
+
+# Rate-limit trend failure warnings per symbol (avoid log spam)
+_TREND_WARN_LAST: Dict[str, float] = {}
+# Round-robin index for rolling trend refresh (synced with batch boundaries)
+_TREND_ROLLING_BATCH_INDEX = 0
+_TREND_ROLLING_LOCK = threading.Lock()
+
+def _rolling_trend_refresh_worker():
+    """Background thread: refresh trend for one batch of symbols every TREND_ROLLING_INTERVAL_SEC, in sync with batch cache."""
+    global _TREND_ROLLING_BATCH_INDEX
+    batches = [SUPPORTED_SYMBOLS[i:i + BATCH_SIZE] for i in range(0, len(SUPPORTED_SYMBOLS), BATCH_SIZE)]
+    if not batches:
+        return
+    executor = ThreadPoolExecutor(max_workers=TREND_ROLLING_WORKERS)
+    try:
+        while True:
+            with _TREND_ROLLING_LOCK:
+                idx = _TREND_ROLLING_BATCH_INDEX % len(batches)
+                _TREND_ROLLING_BATCH_INDEX = (idx + 1) % len(batches)
+            batch_symbols = batches[idx]
+            for _ in executor.map(get_mtf_trend, batch_symbols):
+                pass  # side effect: fill TREND_CACHE
+            time.sleep(TREND_ROLLING_INTERVAL_SEC)
+    except Exception as e:
+        logger.warning("Rolling trend refresh worker error: %s", e)
+    finally:
+        executor.shutdown(wait=False)
+
 def get_mtf_trend(symbol: str) -> Optional[Dict]:
     """Return multi-timeframe EMA trend for a symbol with caching."""
     now = time.time()
@@ -837,15 +1086,46 @@ def get_mtf_trend(symbol: str) -> Optional[Dict]:
     extended_ttl = TREND_CACHE_TTL_SEC * 2
     if cached and (now - cached.get("ts", 0)) < extended_ttl:
         return cached.get("data")
+    stale_data = None
+    stale_age = None
+    if cached:
+        age = now - cached.get("ts", 0)
+        if age < TREND_STALE_FALLBACK_SEC:
+            stale_data = cached.get("data")
+            stale_age = age
     data = {}
     limit = max(TREND_EMA_SLOW * 3, 60)
     for tf in TREND_TIMEFRAMES:
         closes = _fetch_klines(symbol, tf, limit=limit)
-        if not closes:
-            return None
+        if not closes or len(closes) < TREND_EMA_SLOW:
+            if now - _TREND_WARN_LAST.get(symbol, 0) >= TREND_WARN_COOLDOWN_SEC:
+                _TREND_WARN_LAST[symbol] = now
+                if stale_data is not None:
+                    logger.warning(
+                        "Live trend data failed for %s (klines missing/insufficient), using stale cache (age %.0fs)",
+                        symbol, stale_age,
+                    )
+                else:
+                    logger.warning(
+                        "Live trend data failed for %s (no klines and no stale cache); signals will be blocked",
+                        symbol,
+                    )
+            return _mark_stale_trend(stale_data, stale_age) if stale_data else None
         direction, diff = _trend_dir_from_closes(closes)
         if direction is None:
-            return None
+            if now - _TREND_WARN_LAST.get(symbol, 0) >= TREND_WARN_COOLDOWN_SEC:
+                _TREND_WARN_LAST[symbol] = now
+                if stale_data is not None:
+                    logger.warning(
+                        "Live trend data failed for %s (EMA invalid), using stale cache (age %.0fs)",
+                        symbol, stale_age,
+                    )
+                else:
+                    logger.warning(
+                        "Live trend data failed for %s (EMA invalid, no stale cache); signals will be blocked",
+                        symbol,
+                    )
+            return _mark_stale_trend(stale_data, stale_age) if stale_data else None
         data[tf] = direction
         data[f"{tf}_diff"] = diff
     TREND_CACHE[symbol] = {"ts": now, "data": data}
@@ -892,13 +1172,17 @@ def build_trend_meta(symbol: str) -> Dict:
         return {"status": "NO_DATA"}
     fast_tf = TREND_TIMEFRAMES[0] if TREND_TIMEFRAMES else "fast"
     slow_tf = TREND_TIMEFRAMES[1] if len(TREND_TIMEFRAMES) > 1 else fast_tf
-    return {
-        "status": "OK",
+    status = "STALE" if trend.get("_stale") else "OK"
+    out = {
+        "status": status,
         fast_tf: _trend_label(trend.get(fast_tf, 0)),
         slow_tf: _trend_label(trend.get(slow_tf, 0)),
         f"{fast_tf}_diff": trend.get(f"{fast_tf}_diff"),
         f"{slow_tf}_diff": trend.get(f"{slow_tf}_diff"),
     }
+    if trend.get("_stale"):
+        out["stale_age_sec"] = trend.get("_stale_age_sec")
+    return out
 
 
 def _build_compact_signal(levels: List[LiquidationLevel], current_price: float, 
@@ -913,90 +1197,86 @@ def _build_compact_signal(levels: List[LiquidationLevel], current_price: float,
     
     long_clusters_below.sort(key=lambda x: x.strength, reverse=True)
     short_clusters_above.sort(key=lambda x: x.strength, reverse=True)
+
+    sl_pct_dynamic = _sl_pct_for_rr(symbol, current_price) if symbol else 0.0
+    if sl_pct_dynamic <= 0:
+        sl_pct_dynamic = ESTIMATED_SL_PCT
     
+    candidates = []
+
     if short_clusters_above and short_clusters_above[0].strength >= min_strength:
         strongest_short = short_clusters_above[0]
-        # Filter: cluster must be far enough from entry to be actionable
         if strongest_short.distance_from_price >= MIN_CLUSTER_DISTANCE_PCT and strongest_short.distance_from_price < max_distance:
             entry = current_price
-            stop_loss = current_price * (1 - ESTIMATED_SL_PCT / 100.0)  # Use estimated ATR-based SL (1.5%)
-            take_profit = strongest_short.price_level * (1 + TP_CLUSTER_OFFSET_PCT / 100.0)  # TP above cluster (targeting short liquidations)
+            stop_loss = current_price * (1 - sl_pct_dynamic / 100.0)
+            take_profit = strongest_short.price_level * (1 + TP_CLUSTER_OFFSET_PCT / 100.0)
             tp_distance_pct = (take_profit - entry) / entry * 100.0 if entry else 0
             if tp_distance_pct >= MIN_TP_DISTANCE_PCT:
-                # Calculate enhanced confidence
                 base_strength = strongest_short.strength
                 if _enhanced_confidence_score and funding_rate is not None:
                     enhanced_conf = _enhanced_confidence_score(
                         base_strength, strongest_short.distance_from_price, "LONG", funding_rate, max_distance
                     )
                 else:
-                    enhanced_conf = base_strength  # Fallback to base strength
-                
+                    enhanced_conf = base_strength
+                trend_ok = True
                 if symbol:
-                    ok, _ = mtf_trend_allows(symbol, "LONG")
-                    if not ok:
-                        # If LONG is blocked by trend, try SHORT next
-                        pass
-                    else:
-                        risk = entry - stop_loss
-                        reward = take_profit - entry
-                        risk_reward = round(reward / risk, 1) if risk > 0 else 0
-                        return {
-                            "dir": "LONG",
-                            "entry": round(entry, 2),
-                            "sl": round(stop_loss, 2),
-                            "tp": round(take_profit, 2),
-                            "conf": round(enhanced_conf, 2),  # Enhanced confidence
-                            "rr": risk_reward
-                        }
-                else:
-                    risk = entry - stop_loss
-                    reward = take_profit - entry
-                    risk_reward = round(reward / risk, 1) if risk > 0 else 0
-                    return {
+                    trend_ok, _ = mtf_trend_allows(symbol, "LONG")
+                risk = entry - stop_loss
+                reward = take_profit - entry
+                risk_reward = round(reward / risk, 2) if risk > 0 else 0
+                if risk_reward >= MIN_RR_FOR_SIGNAL:
+                    candidates.append({
                         "dir": "LONG",
-                        "entry": round(entry, 2),
-                        "sl": round(stop_loss, 2),
-                        "tp": round(take_profit, 2),
-                        "conf": round(enhanced_conf, 2),  # Enhanced confidence
-                        "rr": risk_reward
-                    }
-    
+                        "entry": _round_price(entry),
+                        "sl": _round_price(stop_loss),
+                        "tp": _round_price(take_profit),
+                        "conf": round(enhanced_conf, 2),
+                        "rr": risk_reward,
+                        "trend_aligned": trend_ok,
+                    })
+
     if long_clusters_below and long_clusters_below[0].strength >= min_strength:
         strongest_long = long_clusters_below[0]
-        # Filter: cluster must be far enough from entry to be actionable
         if strongest_long.distance_from_price >= MIN_CLUSTER_DISTANCE_PCT and strongest_long.distance_from_price < max_distance:
             entry = current_price
-            stop_loss = current_price * (1 + ESTIMATED_SL_PCT / 100.0)  # Use estimated ATR-based SL (1.5%)
-            take_profit = strongest_long.price_level * (1 - TP_CLUSTER_OFFSET_PCT / 100.0)  # TP below cluster (targeting long liquidations)
+            stop_loss = current_price * (1 + sl_pct_dynamic / 100.0)
+            take_profit = strongest_long.price_level * (1 - TP_CLUSTER_OFFSET_PCT / 100.0)
             tp_distance_pct = (entry - take_profit) / entry * 100.0 if entry else 0
             if tp_distance_pct >= MIN_TP_DISTANCE_PCT:
-                # Calculate enhanced confidence
                 base_strength = strongest_long.strength
                 if _enhanced_confidence_score and funding_rate is not None:
                     enhanced_conf = _enhanced_confidence_score(
                         base_strength, strongest_long.distance_from_price, "SHORT", funding_rate, max_distance
                     )
                 else:
-                    enhanced_conf = base_strength  # Fallback to base strength
-                
+                    enhanced_conf = base_strength
+                trend_ok = True
                 if symbol:
-                    ok, _ = mtf_trend_allows(symbol, "SHORT")
-                    if not ok:
-                        return {"dir": "NEUTRAL"}
+                    trend_ok, _ = mtf_trend_allows(symbol, "SHORT")
                 risk = stop_loss - entry
                 reward = entry - take_profit
-                risk_reward = round(reward / risk, 1) if risk > 0 else 0
-                return {
-                    "dir": "SHORT",
-                    "entry": round(entry, 2),
-                    "sl": round(stop_loss, 2),
-                    "tp": round(take_profit, 2),
-                    "conf": round(enhanced_conf, 2),  # Enhanced confidence
-                    "rr": risk_reward
-                }
-    
-    return {"dir": "NEUTRAL"}  # Minimal for NEUTRAL signals
+                risk_reward = round(reward / risk, 2) if risk > 0 else 0
+                if risk_reward >= MIN_RR_FOR_SIGNAL:
+                    candidates.append({
+                        "dir": "SHORT",
+                        "entry": _round_price(entry),
+                        "sl": _round_price(stop_loss),
+                        "tp": _round_price(take_profit),
+                        "conf": round(enhanced_conf, 2),
+                        "rr": risk_reward,
+                        "trend_aligned": trend_ok,
+                    })
+
+    if not candidates:
+        return {"dir": "NEUTRAL"}
+
+    if symbol:
+        aligned = [c for c in candidates if c.get("trend_aligned")]
+        if aligned:
+            candidates = aligned
+    candidates.sort(key=lambda c: (c.get("conf", 0), c.get("rr", 0)), reverse=True)
+    return candidates[0]
 
 def _build_signal_for_direction(
     levels: List[LiquidationLevel],
@@ -1013,6 +1293,9 @@ def _build_signal_for_direction(
     short_clusters_above = [l for l in levels if l.side == "short" and l.price_level > current_price]
     long_clusters_below.sort(key=lambda x: x.strength, reverse=True)
     short_clusters_above.sort(key=lambda x: x.strength, reverse=True)
+    sl_pct_dynamic = _sl_pct_for_rr(symbol, current_price) if symbol else 0.0
+    if sl_pct_dynamic <= 0:
+        sl_pct_dynamic = ESTIMATED_SL_PCT
 
     if direction == "LONG" and short_clusters_above and short_clusters_above[0].strength >= min_strength:
         strongest = short_clusters_above[0]
@@ -1020,24 +1303,26 @@ def _build_signal_for_direction(
         if strongest.distance_from_price < MIN_CLUSTER_DISTANCE_PCT or strongest.distance_from_price >= max_distance:
             return None
         entry = current_price
-        stop_loss = current_price * 0.98
+        stop_loss = current_price * (1 - sl_pct_dynamic / 100.0)
         take_profit = strongest.price_level * (1 + TP_CLUSTER_OFFSET_PCT / 100.0)  # TP above cluster (targeting short liquidations)
         tp_distance_pct = (take_profit - entry) / entry * 100.0 if entry else 0
         if tp_distance_pct >= MIN_TP_DISTANCE_PCT:
+            trend_ok = True
             if symbol:
-                ok, _ = mtf_trend_allows(symbol, "LONG")
-                if not ok:
-                    return None
+                trend_ok, _ = mtf_trend_allows(symbol, "LONG")
             risk = entry - stop_loss
             reward = take_profit - entry
-            rr = round(reward / risk, 1) if risk > 0 else 0
+            rr = round(reward / risk, 2) if risk > 0 else 0
+            if rr < MIN_RR_FOR_SIGNAL:
+                return None  # Reject low RR signals
             return {
                 "dir": "LONG",
-                "entry": round(entry, 2),
-                "sl": round(stop_loss, 2),
-                "tp": round(take_profit, 2),
+                "entry": _round_price(entry),
+                "sl": _round_price(stop_loss),
+                "tp": _round_price(take_profit),
                 "conf": round(strongest.strength, 2),
                 "rr": rr,
+                "trend_aligned": trend_ok,
             }
 
     if direction == "SHORT" and long_clusters_below and long_clusters_below[0].strength >= min_strength:
@@ -1046,24 +1331,26 @@ def _build_signal_for_direction(
         if strongest.distance_from_price < MIN_CLUSTER_DISTANCE_PCT or strongest.distance_from_price >= max_distance:
             return None
         entry = current_price
-        stop_loss = current_price * 1.02
+        stop_loss = current_price * (1 + sl_pct_dynamic / 100.0)
         take_profit = strongest.price_level * (1 - TP_CLUSTER_OFFSET_PCT / 100.0)  # TP below cluster (targeting long liquidations)
         tp_distance_pct = (entry - take_profit) / entry * 100.0 if entry else 0
         if tp_distance_pct >= MIN_TP_DISTANCE_PCT:
+            trend_ok = True
             if symbol:
-                ok, _ = mtf_trend_allows(symbol, "SHORT")
-                if not ok:
-                    return None
+                trend_ok, _ = mtf_trend_allows(symbol, "SHORT")
             risk = stop_loss - entry
             reward = entry - take_profit
-            rr = round(reward / risk, 1) if risk > 0 else 0
+            rr = round(reward / risk, 2) if risk > 0 else 0
+            if rr < MIN_RR_FOR_SIGNAL:
+                return None  # Reject low RR signals
             return {
                 "dir": "SHORT",
-                "entry": round(entry, 2),
-                "sl": round(stop_loss, 2),
-                "tp": round(take_profit, 2),
+                "entry": _round_price(entry),
+                "sl": _round_price(stop_loss),
+                "tp": _round_price(take_profit),
                 "conf": round(strongest.strength, 2),
                 "rr": rr,
+                "trend_aligned": trend_ok,
             }
     return None
 
@@ -1080,9 +1367,9 @@ def _build_compact_levels(levels: List[LiquidationLevel], current_price: float) 
     
     result = {}
     if support:
-        result["support"] = [round(p, 2) for p in support]
+        result["support"] = [_round_price(p) for p in support]
     if resistance:
-        result["resistance"] = [round(p, 2) for p in resistance]
+        result["resistance"] = [_round_price(p) for p in resistance]
     
     return result
 
@@ -1098,9 +1385,10 @@ def _build_compact_sentiment(oi_data: Dict) -> Dict:
     if total_oi < 10000:
         return {}
     
-    if long_short_ratio > 1.2:
+    bull, bear, _bull_high, _bear_high = _sentiment_thresholds(oi_data)
+    if long_short_ratio > bull:
         bias = "BULLISH"
-    elif long_short_ratio < 0.8:
+    elif long_short_ratio < bear:
         bias = "BEARISH"
     else:
         bias = "NEUTRAL"
@@ -1128,7 +1416,7 @@ def _build_compact_clusters(levels: List[LiquidationLevel], current_price: float
     
     return {
         "best": {
-            "price": round(best.price_level, 2),
+            "price": _round_price(best.price_level),
             "side": best.side,
             "str": round(best.strength, 1),  # 1 decimal instead of 2
             "dist": round(actual_dist, 2)  # 2 decimals to show small distances (0.01%, 0.03%, etc.)
@@ -1136,73 +1424,7 @@ def _build_compact_clusters(levels: List[LiquidationLevel], current_price: float
         # Removed "count" - redundant
     }
 
-# More specific paths first so /api/trade/batch/{aster,hyperliquid} are not matched by /api/trade/{symbol}
-@app.get("/api/trade/batch/aster", response_model=BatchTradeResponse)
-async def get_batch_trade_data_aster(
-    min_strength: float = Query(0.70, ge=0.0, le=1.0),
-    max_distance: float = Query(3.0, ge=0.0, le=10.0)
-):
-    """
-    Same response shape as /api/trade/batch but optimized for Hyperliquid trading venue.
-    Prices prioritized from Hyperliquid (trading venue), fallback to Aster DEX.
-    Clusters prioritized from Hyperliquid (trading venue), fallback to Binance (no synthetic).
-    Trend filter uses Hyperliquid klines (trading venue), fallback to Binance.
-    Symbols without real cluster data are omitted.
-    Symbols: ETH, SOL, BNB, XRP, DOGE, BCH, LINK, XMR, ASTER, HYPE, SUI, PUMP.
-    """
-    if fetch_aster_batch_data is None:
-        raise HTTPException(status_code=503, detail="Aster batch module not available")
-    data_aster = fetch_aster_batch_data()
-    data_hl = fetch_hyperliquid_batch_data() if fetch_hyperliquid_batch_data else None
-    # Prioritize Hyperliquid prices (trading venue) over Aster prices
-    hl_prices = data_hl.get("current_prices", {}) if data_hl else {}
-    aster_prices = data_aster["current_prices"]
-    results = {}
-    for symbol in aster_prices.keys():
-        # Use Hyperliquid mark price if available (trading venue), else Aster price
-        current_price = hl_prices.get(symbol) or aster_prices.get(symbol, 0.0)
-        levels = None
-        oi_data = {}
-        cluster_source = None
-        # Prioritize Hyperliquid data first (since we trade on Hyperliquid)
-        if data_hl and symbol in data_hl.get("liquidation_levels", {}) and data_hl["liquidation_levels"].get(symbol):
-            levels = data_hl["liquidation_levels"][symbol]
-            oi_data = data_hl.get("open_interest_data", {}).get(symbol, {})
-            cluster_source = "hyperliquid"
-            levels = _levels_with_distance_for_price(levels, current_price)
-        elif heatmap and symbol in getattr(heatmap, "liquidation_levels", {}) and heatmap.liquidation_levels.get(symbol):
-            levels = heatmap.liquidation_levels[symbol]
-            oi_data = heatmap.open_interest_data.get(symbol, {})
-            cluster_source = "binance"
-            levels = _levels_with_distance_for_price(levels, current_price)
-        if cluster_source is None or not levels:
-            continue  # no synthetic: only include symbols with Hyperliquid or Binance data
-        signal_levels = [l for l in levels if l.distance_from_price >= MIN_CLUSTER_DISTANCE_PCT and l.distance_from_price < max_distance and l.strength >= min_strength]
-        # Get funding_rate from oi_data if available (Hyperliquid only)
-        funding_rate = oi_data.get("funding_rate") if isinstance(oi_data, dict) else None
-        signal = _build_compact_signal(signal_levels, current_price, min_strength, max_distance, symbol, funding_rate)
-        symbol_data = {
-            "price": round(current_price, 2) if current_price else 0.0,
-            "signal": signal,
-            "trend": build_trend_meta(symbol),
-            "cluster_source": cluster_source,
-        }
-        levels_data = _build_compact_levels(levels, current_price)
-        if levels_data:
-            symbol_data["levels"] = levels_data
-        sentiment_data = _build_compact_sentiment(oi_data)
-        if sentiment_data:
-            symbol_data["sentiment"] = sentiment_data
-        clusters_data = _build_compact_clusters(levels, current_price)
-        if clusters_data:
-            symbol_data["clusters"] = clusters_data
-        results[symbol] = symbol_data
-    return BatchTradeResponse(
-        results=results,
-        ts=datetime.now().strftime("%H:%M:%S"),
-        data_age_ms=0  # Aster batch always fetches fresh data
-    )
-
+# More specific path first so /api/trade/batch/hyperliquid is not matched by /api/trade/{symbol}
 def _process_symbol_batch(symbols: List[str], data: Dict, min_strength: float, max_distance: float, skip_trend: bool = False) -> Dict:
     """Process a batch of symbols and return results. skip_trend=True skips trend calculation for speed."""
     current_prices = data["current_prices"]
@@ -1218,10 +1440,12 @@ def _process_symbol_batch(symbols: List[str], data: Dict, min_strength: float, m
         levels = liquidation_levels.get(symbol, [])
         signal_levels = [l for l in levels if l.distance_from_price >= MIN_CLUSTER_DISTANCE_PCT and l.distance_from_price < max_distance and l.strength >= min_strength]
         oi_data = open_interest_data.get(symbol, {})
-        funding_rate = oi_data.get("funding_rate")
+        funding_rate = oi_data.get("funding_rate_smooth") if isinstance(oi_data, dict) else None
+        if funding_rate is None and isinstance(oi_data, dict):
+            funding_rate = oi_data.get("funding_rate")
         signal = _build_compact_signal(signal_levels, current_price, min_strength, max_distance, symbol, funding_rate)
         symbol_data = {
-            "price": round(current_price, 2) if current_price else 0.0,
+            "price": _round_price(current_price) if current_price else 0.0,
             "signal": signal,
             "trend": {} if skip_trend else build_trend_meta(symbol),  # Skip trend for speed if requested
         }
@@ -1351,7 +1575,7 @@ async def get_batch_trade_data(
             
             # Build compact data: price first so it's always at top level in JSON
             symbol_data = {
-                "price": round(current_price, 2) if current_price else 0.0,
+                "price": _round_price(current_price) if current_price else 0.0,
                 "signal": signal,
                 "trend": build_trend_meta(symbol),
             }
@@ -1408,7 +1632,7 @@ async def get_compact_trade_data(
         signal_short = _build_signal_for_direction(signal_levels, current_price, "SHORT", min_strength, max_distance, symbol)
         return CompactTradeResponse(
             symbol=symbol,
-            price=round(current_price, 2),
+            price=_round_price(current_price),
             signal=primary_signal,
             levels=_build_compact_levels(levels, current_price),
             sentiment=_build_compact_sentiment(oi_data),

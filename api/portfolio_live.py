@@ -1,250 +1,17 @@
 """
-Live portfolio fetch for Aster and Hyperliquid (positions + equity).
-Used by vantagev2_api to show correct open position counts and equity.
-- Aster: EIP-712 signed GET /fapi/v3/account (requires ASTER_API_KEY, ASTER_API_SECRET, etc.)
-- Hyperliquid: public POST info endpoint (no auth; requires HL_ACCOUNT_ADDRESS).
+Live portfolio fetch for Hyperliquid (positions + equity).
+Used by vantagev2_api for open position counts, equity, and closed trades.
+Hyperliquid: public POST info endpoint (no auth; requires HL_ACCOUNT_ADDRESS).
 """
 import os
-import time
-import math
 import requests
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-
-# Aster EIP-712 (same as clawd/trader.py)
-ASTER_BASE = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").strip()
-ASTER_API_KEY = os.getenv("ASTER_API_KEY")
-ASTER_API_SECRET = os.getenv("ASTER_API_SECRET")
-ASTER_USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "0x587Fa034fb673974E00DCF7F4078a498f9799D54")
-ASTER_API_SIGNER = os.getenv("ASTER_API_SIGNER", "0xf25645a642207EadE9203F9E96aa31C08Ba963e9")
 
 # Hyperliquid (read-only; no private key needed)
 HL_INFO_URL = os.getenv("HL_BASE_URL", "https://api.hyperliquid.xyz").strip().rstrip("/") + "/info"
 HL_ACCOUNT_ADDRESS = os.getenv("HL_ACCOUNT_ADDRESS")
 HL_DEX = os.getenv("HL_DEX", "")
-
-EIP712_DOMAIN = {
-    "name": "AsterSignTransaction",
-    "version": "1",
-    "chainId": 1666,
-    "verifyingContract": "0x0000000000000000000000000000000000000000",
-}
-
-
-def _aster_eip712_sign(params: Dict[str, str]) -> Optional[tuple]:
-    """Sign params with EIP-712. Returns (signature_hex_no_0x, query_string) or None."""
-    try:
-        from eth_account import Account
-        from eth_account.messages import encode_typed_data
-    except ImportError:
-        return None
-    api_secret = (ASTER_API_SECRET or "").strip()
-    if api_secret.startswith("0x"):
-        api_secret = api_secret[2:]
-    if not api_secret:
-        return None
-    try:
-        account = Account.from_key(api_secret)
-    except Exception:
-        return None
-    sorted_items = sorted(params.items())
-    query_string = "&".join([f"{k}={v}" for k, v in sorted_items])
-    typed_data = {
-        "types": {
-            "EIP712Domain": [
-                {"name": "name", "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
-            ],
-            "Message": [{"name": "msg", "type": "string"}],
-        },
-        "primaryType": "Message",
-        "domain": EIP712_DOMAIN,
-        "message": {"msg": query_string},
-    }
-    encoded = encode_typed_data(full_message=typed_data)
-    signed = account.sign_message(encoded)
-    sig_hex = signed.signature.hex()
-    if sig_hex.startswith("0x"):
-        sig_hex = sig_hex[2:]
-    return sig_hex, query_string
-
-
-def _aster_equity_from_account(account: Dict[str, Any]) -> Optional[float]:
-    try:
-        available = float(account.get("availableBalance", 0) or 0)
-        pos_margin = float(account.get("totalPositionInitialMargin", 0) or 0)
-        order_margin = float(account.get("totalOpenOrderInitialMargin", 0) or 0)
-        wallet = float(account.get("totalWalletBalance", 0) or 0)
-        total = available + pos_margin + order_margin
-        if wallet > total:
-            total = wallet
-        if total <= 0:
-            total = available
-        return round(total, 2)
-    except (TypeError, ValueError):
-        return None
-
-
-def _aster_positions_to_dashboard(account: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Convert Aster /fapi/v3/account positions to dashboard open_positions format (may lack PnL if account omits it)."""
-    out = []
-    for p in account.get("positions", []) or []:
-        try:
-            amt = float(p.get("positionAmt", 0) or 0)
-        except (TypeError, ValueError):
-            amt = 0
-        if amt == 0:
-            continue
-        try:
-            entry = float(p.get("entryPrice", 0) or 0)
-        except (TypeError, ValueError):
-            entry = 0
-        leverage = 1
-        try:
-            lev_val = p.get("leverage") or p.get("leveragePercent")
-            if lev_val is not None:
-                leverage = int(lev_val) if isinstance(lev_val, (int, float)) else 1
-        except (TypeError, ValueError):
-            pass
-        side = "LONG" if amt > 0 else "SHORT"
-        try:
-            upnl = float(p.get("unrealizedProfit", 0) or p.get("unRealizedProfit", 0) or p.get("up", 0) or 0)
-        except (TypeError, ValueError):
-            upnl = 0
-        pnl_pct = None
-        notional = abs(amt) * entry if entry else 0
-        if notional:
-            pnl_pct = round((upnl / notional) * 100, 2)
-        position_size_usd = round(notional, 2) if notional else None
-        pnl_usd = round(upnl, 2) if upnl is not None else None
-        opened_at = None
-        try:
-            ut = p.get("updateTime") or p.get("update_time")
-            if ut is not None:
-                ms = int(ut)
-                opened_at = datetime.utcfromtimestamp(ms / 1000.0).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        except (TypeError, ValueError):
-            pass
-        out.append({
-            "symbol": p.get("symbol", ""),
-            "side": side,
-            "entry_price": entry,
-            "entry_qty": abs(amt),
-            "leverage": leverage,
-            "tp_price": None,
-            "sl_price": None,
-            "opened_at": opened_at,
-            "pnl_pct": pnl_pct,
-            "pnl_usd": pnl_usd,
-            "position_size_usd": position_size_usd,
-        })
-    return out
-
-
-def _aster_positions_from_risk(position_risk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Convert Aster /fapi/v2/positionRisk array to dashboard open_positions format (includes unRealizedProfit)."""
-    out = []
-    for p in position_risk or []:
-        try:
-            amt = float(p.get("positionAmt", 0) or 0)
-        except (TypeError, ValueError):
-            amt = 0
-        if amt == 0:
-            continue
-        try:
-            entry = float(p.get("entryPrice", 0) or 0)
-        except (TypeError, ValueError):
-            entry = 0
-        leverage = 1
-        try:
-            lev_val = p.get("leverage")
-            if lev_val is not None:
-                leverage = int(float(lev_val)) if lev_val else 1
-        except (TypeError, ValueError):
-            pass
-        side = "LONG" if amt > 0 else "SHORT"
-        try:
-            upnl = float(p.get("unRealizedProfit", 0) or p.get("unrealizedProfit", 0) or p.get("up", 0) or 0)
-        except (TypeError, ValueError):
-            upnl = 0
-        notional = abs(amt) * entry if entry else 0
-        pnl_pct = round((upnl / notional) * 100, 2) if notional else None
-        position_size_usd = round(notional, 2) if notional else None
-        pnl_usd = round(upnl, 2)
-        opened_at = None
-        try:
-            ut = p.get("updateTime") or p.get("update_time")
-            if ut is not None:
-                ms = int(ut)
-                opened_at = datetime.utcfromtimestamp(ms / 1000.0).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        except (TypeError, ValueError):
-            pass
-        out.append({
-            "symbol": p.get("symbol", ""),
-            "side": side,
-            "entry_price": entry,
-            "entry_qty": abs(amt),
-            "leverage": leverage,
-            "tp_price": None,
-            "sl_price": None,
-            "opened_at": opened_at,
-            "pnl_pct": pnl_pct,
-            "pnl_usd": pnl_usd,
-            "position_size_usd": position_size_usd,
-        })
-    return out
-
-
-def _aster_signed_get(path: str) -> Optional[Any]:
-    """Perform EIP-712 signed GET request to Aster. Returns JSON response or None."""
-    sig_result = _aster_eip712_sign(
-        {
-            "nonce": str(math.trunc(time.time() * 1_000_000)),
-            "recvWindow": "5000",
-            "signer": ASTER_API_SIGNER,
-            "timestamp": str(int(time.time() * 1000)),
-            "user": ASTER_USER_ADDRESS,
-        }
-    )
-    if not sig_result:
-        return None
-    sig_hex, query_string = sig_result
-    url = f"{ASTER_BASE}{path}?{query_string}&signature={sig_hex}"
-    headers = {"X-ASTER-APIKEY": ASTER_API_KEY}
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
-
-
-def fetch_live_aster() -> Optional[Dict[str, Any]]:
-    """
-    Fetch live Aster account (equity + positions). Uses position risk for live PnL when available.
-    Returns: {"equity": float, "open_positions": list, "open_positions_count": int}
-    """
-    if not ASTER_API_KEY or not ASTER_API_SECRET:
-        return None
-    # Get account for equity and fallback positions
-    data = _aster_signed_get("/fapi/v3/account")
-    if not isinstance(data, dict):
-        return None
-    equity = _aster_equity_from_account(data)
-    positions = _aster_positions_to_dashboard(data)
-    # Prefer position risk for live PnL (unRealizedProfit); fallback to account positions
-    risk_data = _aster_signed_get("/fapi/v2/positionRisk")
-    if isinstance(risk_data, list) and len(risk_data) > 0:
-        positions_from_risk = _aster_positions_from_risk(risk_data)
-        if positions_from_risk:
-            positions = positions_from_risk
-    return {
-        "equity": equity,
-        "open_positions": positions,
-        "open_positions_count": len(positions),
-    }
 
 
 def _hl_get_mark_prices() -> Dict[str, float]:
@@ -356,8 +123,10 @@ def _hl_normalize_positions(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 opened_at = datetime.utcfromtimestamp(ms / 1000.0).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         except (TypeError, ValueError):
             pass
+        # Use symbol with USDT suffix for dashboard (matches trading pairs)
+        symbol_display = f"{coin}USDT" if (isinstance(coin, str) and coin) else ""
         out.append({
-            "symbol": coin,
+            "symbol": symbol_display or coin,
             "side": side,
             "entry_price": entry,
             "entry_qty": qty,
@@ -370,6 +139,24 @@ def _hl_normalize_positions(state: Dict[str, Any]) -> List[Dict[str, Any]]:
             "position_size_usd": position_size_usd,
         })
     return out
+
+
+def _hl_equity_from_spot_state(spot_state: Dict[str, Any]) -> Optional[float]:
+    """Extract total USDC balance from spotClearinghouseState (matches Hyperliquid UI 'Total Balance')."""
+    balances = spot_state.get("balances", [])
+    if not isinstance(balances, list):
+        return None
+    for bal in balances:
+        if not isinstance(bal, dict):
+            continue
+        coin = bal.get("coin", "")
+        if coin == "USDC":
+            try:
+                total = float(bal.get("total", 0) or 0)
+                return round(total, 2) if total > 0 else None
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def _hl_equity_from_state(state: Dict[str, Any]) -> Optional[float]:
@@ -447,8 +234,12 @@ def _hl_win_rate_from_fills(fills: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+# Default leverage for closed-trade PnL% when exchange fill doesn't provide it (ROE = PnL/margin).
+DEFAULT_LEVERAGE_FOR_CLOSED_TRADES = 5
+
+
 def _hl_last_10_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Build dashboard last_10_trades from close fills only (Close Long/Short). Use net PnL = closedPnl - fee to match HL UI."""
+    """Build dashboard last_10_trades from close fills only. PnL% = ROE (on margin) so it reflects leverage."""
     closed = []
     for f in fills:
         if not isinstance(f, dict):
@@ -466,26 +257,43 @@ def _hl_last_10_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str,
         except (TypeError, ValueError):
             continue
         coin = f.get("coin", "")
-        # Skip spot (e.g. @107)
         if isinstance(coin, str) and coin.startswith("@"):
             continue
         pnl_pct = None
         notional_usd = None
+        volume_usd = None  # open + close notional per position
+        leverage = DEFAULT_LEVERAGE_FOR_CLOSED_TRADES
         try:
             px = float(f.get("px") or 0)
             sz = float(f.get("sz") or 0)
             if px > 0 and sz > 0:
-                notional_usd = round(px * sz, 2)
-                pnl_pct = round((pnl / notional_usd) * 100, 2)
+                close_notional = px * sz
+                notional_usd = round(close_notional, 2)
+                # ROE = PnL / margin (margin = notional/leverage); HL fills don't include leverage, use default
+                margin = notional_usd / leverage if leverage else notional_usd
+                if margin > 0:
+                    pnl_pct = round((pnl / margin) * 100, 2)
+                # Open notional: Close Long => entry*qty = exit*qty - pnl; Close Short => entry*qty = exit*qty + pnl
+                dir_str = (f.get("dir") or "").strip()
+                dir_lower = dir_str.lower()
+                if "long" in dir_lower or dir_str == "L":
+                    open_notional = close_notional - pnl
+                else:
+                    open_notional = close_notional + pnl
+                open_notional = max(0.0, open_notional)
+                volume_usd = round(open_notional + close_notional, 2)
         except (TypeError, ValueError):
             pass
         dir_str = (f.get("dir") or "").strip()
-        side = "LONG" if "Long" in dir_str or dir_str == "L" else "SHORT" if "Short" in dir_str or dir_str == "S" else None
+        dir_lower = dir_str.lower()
+        side = "LONG" if "long" in dir_lower or dir_str == "L" else "SHORT" if "short" in dir_lower or dir_str == "S" else None
         closed.append({
             "symbol": coin,
             "pnl_usd": round(pnl, 2),
             "pnl_pct": pnl_pct,
             "notional_usd": notional_usd,
+            "volume_usd": volume_usd,
+            "leverage": leverage,
             "side": side,
             "exit_type": "TAKE_PROFIT" if pnl > 0 else "STOP_LOSS",
             "time": f"{t}",
@@ -504,7 +312,7 @@ def _hl_last_10_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str,
 
 
 def _hl_all_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Build full trade history from close fills only (Close Long/Short) for chart. Use net PnL = closedPnl - fee to match HL UI."""
+    """Build full trade history from close fills only for chart. PnL% = ROE (on margin) so it reflects leverage."""
     closed = []
     for f in fills:
         if not isinstance(f, dict):
@@ -526,21 +334,37 @@ def _hl_all_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str, Any
             continue
         pnl_pct = None
         notional_usd = None
+        volume_usd = None
+        leverage = DEFAULT_LEVERAGE_FOR_CLOSED_TRADES
         try:
             px = float(f.get("px") or 0)
             sz = float(f.get("sz") or 0)
             if px > 0 and sz > 0:
-                notional_usd = round(px * sz, 2)
-                pnl_pct = round((pnl / notional_usd) * 100, 2)
+                close_notional = px * sz
+                notional_usd = round(close_notional, 2)
+                margin = notional_usd / leverage if leverage else notional_usd
+                if margin > 0:
+                    pnl_pct = round((pnl / margin) * 100, 2)
+                dir_str = (f.get("dir") or "").strip()
+                dir_lower = dir_str.lower()
+                if "long" in dir_lower or dir_str == "L":
+                    open_notional = close_notional - pnl
+                else:
+                    open_notional = close_notional + pnl
+                open_notional = max(0.0, open_notional)
+                volume_usd = round(open_notional + close_notional, 2)
         except (TypeError, ValueError):
             pass
         dir_str = (f.get("dir") or "").strip()
-        side = "LONG" if "Long" in dir_str or dir_str == "L" else "SHORT" if "Short" in dir_str or dir_str == "S" else None
+        dir_lower = dir_str.lower()
+        side = "LONG" if "long" in dir_lower or dir_str == "L" else "SHORT" if "short" in dir_lower or dir_str == "S" else None
         closed.append({
             "symbol": coin,
             "pnl_usd": round(pnl, 2),
             "pnl_pct": pnl_pct,
             "notional_usd": notional_usd,
+            "volume_usd": volume_usd,
+            "leverage": leverage,
             "side": side,
             "exit_type": "TAKE_PROFIT" if pnl > 0 else "STOP_LOSS",
             "time": f"{t}",
@@ -559,10 +383,27 @@ def fetch_live_hyperliquid() -> Optional[Dict[str, Any]]:
     """
     Fetch live Hyperliquid: clearinghouse state (equity + positions) and user fills (win rate).
     No auth. Returns: equity, open_positions, and when fills available: total_trades, won, lost, win_rate_pct.
+    Uses spot balance (spotClearinghouseState) for equity to match Hyperliquid UI 'Total Balance'.
     """
     if not HL_ACCOUNT_ADDRESS or not HL_ACCOUNT_ADDRESS.strip():
         return None
     user = HL_ACCOUNT_ADDRESS.strip().lower()
+    
+    # Fetch spot balance first (matches UI "Total Balance")
+    equity = None
+    try:
+        spot_payload = {"type": "spotClearinghouseState", "user": user}
+        if HL_DEX:
+            spot_payload["dex"] = HL_DEX
+        spot_r = requests.post(HL_INFO_URL, json=spot_payload, timeout=10)
+        spot_r.raise_for_status()
+        spot_state = spot_r.json()
+        if isinstance(spot_state, dict):
+            equity = _hl_equity_from_spot_state(spot_state)
+    except Exception:
+        pass  # Fall back to perpetuals accountValue
+    
+    # Fetch perpetuals state for positions
     payload = {"type": "clearinghouseState", "user": user}
     if HL_DEX:
         payload["dex"] = HL_DEX
@@ -572,7 +413,9 @@ def fetch_live_hyperliquid() -> Optional[Dict[str, Any]]:
         state = r.json()
         if not isinstance(state, dict):
             return None
-        equity = _hl_equity_from_state(state)
+        # Use spot equity if available, otherwise fall back to perpetuals accountValue
+        if equity is None:
+            equity = _hl_equity_from_state(state)
         positions = _hl_normalize_positions(state)
         out = {
             "equity": equity,

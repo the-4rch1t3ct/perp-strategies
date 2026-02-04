@@ -2,17 +2,18 @@
 # Start Vantage2 API (portfolio dashboard, fundingOI, etc.)
 # Always stops any existing instance on the port before starting.
 
-cd /home/botadmin/memecoin-perp-strategies/api
+cd /home/botadmin/perp-strategies/api
 
-# Use venv if available
-if [ -d "/home/botadmin/memecoin-perp-strategies/venv" ]; then
-    source /home/botadmin/memecoin-perp-strategies/venv/bin/activate
+# Preferred Python: reuse clawd trading venv (FastAPI + uvicorn already installed there)
+PYTHON_BIN="/home/botadmin/clawd/.venv/bin/python"
+if [ ! -x "$PYTHON_BIN" ]; then
+    PYTHON_BIN="python3"
 fi
 
-# Load env for live dashboard data (positions + equity + HL win rate from exchanges)
-# Set HL_ACCOUNT_ADDRESS for Hyperliquid; ASTER_API_KEY + ASTER_API_SECRET for Aster
-if [ -f "/home/botadmin/memecoin-perp-strategies/api/.env" ]; then
-    set -a; source "/home/botadmin/memecoin-perp-strategies/api/.env"; set +a
+# Load env for live dashboard data (positions + equity + HL win rate)
+# Set HL_ACCOUNT_ADDRESS for Hyperliquid
+if [ -f "/home/botadmin/perp-strategies/api/.env" ]; then
+    set -a; source "/home/botadmin/perp-strategies/api/.env"; set +a
 fi
 if [ -f "/home/botadmin/clawd/.env.portfolio" ]; then
     set -a; source "/home/botadmin/clawd/.env.portfolio"; set +a
@@ -58,4 +59,4 @@ echo "Starting Vantage2 API on port $PORT..."
 echo "Dashboard: http://localhost:$PORT/portfolio-dashboard"
 echo ""
 
-exec python3 vantagev2_api.py
+exec "$PYTHON_BIN" vantagev2_api.py

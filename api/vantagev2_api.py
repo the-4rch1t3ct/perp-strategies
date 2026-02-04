@@ -7,11 +7,11 @@ Returns Open Interest and Funding Rate for all symbols
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import ccxt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
 from collections import deque
 import time
@@ -19,7 +19,7 @@ import json
 import os
 from pathlib import Path
 
-# Load .env file if it exists (for HL_ACCOUNT_ADDRESS, ASTER_API_KEY, etc.)
+# Load .env file if it exists (for HL_ACCOUNT_ADDRESS, etc.)
 _env_path = Path(__file__).parent / ".env"
 if _env_path.exists():
     with open(_env_path) as f:
@@ -127,12 +127,18 @@ def get_exchange():
     return _exchange
 
 
-# Portfolio dashboard data (Aster + Hyperliquid)
+# Portfolio dashboard data (Hyperliquid)
 CLAWD_MEMORY_DIR = Path("/home/botadmin/clawd/memory")
 HL_PERF_PATH = CLAWD_MEMORY_DIR / "hyperliquid-trading-performance.json"
 HL_POS_PATH = CLAWD_MEMORY_DIR / "hyperliquid-trading-positions.json"
-HL_EQUITY_SNAPSHOTS_PATH = CLAWD_MEMORY_DIR / "hl_equity_snapshots.json"
-HL_EQUITY_SNAPSHOTS_MAX = 48  # ~30min interval over 24h
+# Rolling 24h: one snapshot file for all metrics (equity, win_rate_pct, sharpe_ratio, profit_factor). Persisted; survives restarts.
+DASHBOARD_SNAPSHOTS_PATH = CLAWD_MEMORY_DIR / "dashboard_24h_snapshots.json"
+DASHBOARD_SNAPSHOTS_MAX = 48  # keep last 48 entries (~30min interval over 24h)
+# Daily equity snapshots (UTC midnight-based). Used for daily PnL calendar.
+DASHBOARD_DAILY_EQUITY_PATH = CLAWD_MEMORY_DIR / "dashboard_daily_equity.json"
+DASHBOARD_DAILY_EQUITY_MAX = 370  # ~1 year of daily snapshots
+# After reset: only show trades that closed on or after this time (ISO ts). Set by reset_dashboard_data.sh.
+DASHBOARD_PERFORMANCE_SINCE_PATH = CLAWD_MEMORY_DIR / "dashboard_performance_since.json"
 
 # Optional live fetch for positions/equity (set env for HL to enable)
 try:
@@ -200,11 +206,12 @@ def _extract_open_positions(positions: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _bucket_stats(trade_list: list, include_pnl_pct: bool = True) -> Dict[str, Any]:
-    """Compute overview metrics for a list of trade dicts (all, longs, or shorts)."""
+    """Compute overview metrics. PnL% = ROE (total PnL / total margin) when leverage is present."""
     pnls = []
     win_trades = []
     loss_trades = []
     volume_usd = 0.0
+    total_margin_usd = 0.0
     for t in trade_list or []:
         if not isinstance(t, dict):
             continue
@@ -218,9 +225,24 @@ def _bucket_stats(trade_list: list, include_pnl_pct: bool = True) -> Dict[str, A
         elif p < 0:
             loss_trades.append(t)
         try:
-            vol = t.get("notional_usd")
+            # Volume = open + close notional per position (when volume_usd present); else close notional only
+            vol = t.get("volume_usd") if t.get("volume_usd") is not None else t.get("notional_usd")
             if vol is not None:
                 volume_usd += float(vol)
+            # Margin for ROE = position notional at entry / leverage (use close notional, not open+close)
+            notional = t.get("notional_usd")
+            lev = t.get("leverage")
+            if notional is not None and lev is not None:
+                try:
+                    lv = float(lev)
+                    if lv > 0:
+                        total_margin_usd += float(notional) / lv
+                    else:
+                        total_margin_usd += float(notional)
+                except (TypeError, ValueError):
+                    total_margin_usd += float(notional)
+            elif notional is not None:
+                total_margin_usd += float(notional)
         except (TypeError, ValueError):
             pass
     n = len(pnls)
@@ -235,7 +257,17 @@ def _bucket_stats(trade_list: list, include_pnl_pct: bool = True) -> Dict[str, A
     avg_loss_usd = round(sum(losses) / len(losses), 2) if losses else None
     pl_ratio = round(avg_profit_usd / abs(avg_loss_usd), 2) if (avg_profit_usd is not None and avg_loss_usd is not None and avg_loss_usd != 0) else None
     volume_usd = round(volume_usd, 2) if volume_usd else None
-    pnl_pct = round((sum(pnls) / volume_usd) * 100, 2) if (include_pnl_pct and volume_usd and volume_usd > 0) else None
+    total_margin_usd = round(total_margin_usd, 2) if total_margin_usd else None
+    # ROE-style: PnL% = total PnL / total margin (with leverage); fallback to PnL/volume if no margin
+    if include_pnl_pct and n:
+        if total_margin_usd and total_margin_usd > 0:
+            pnl_pct = round((sum(pnls) / total_margin_usd) * 100, 2)
+        elif volume_usd and volume_usd > 0:
+            pnl_pct = round((sum(pnls) / volume_usd) * 100, 2)
+        else:
+            pnl_pct = None
+    else:
+        pnl_pct = None
     win_pcts = []
     for t in win_trades:
         try:
@@ -288,25 +320,53 @@ def _parse_trade_time(t: dict) -> Optional[datetime]:
         return None
 
 
-def _equity_snapshot_update_and_get_24h(current_equity: Optional[float]) -> Optional[float]:
-    """Append current equity to snapshots, trim to last 48, return equity closest to now-24h."""
-    if current_equity is None:
-        current_equity = 0.0
-    try:
-        eq = float(current_equity)
-    except (TypeError, ValueError):
-        return None
+def _dashboard_snapshots_update_and_get_24h(
+    current_equity: Optional[float],
+    win_rate_pct: Optional[float],
+    sharpe_ratio: Optional[float],
+    profit_factor: Optional[float],
+) -> Dict[str, Optional[float]]:
+    """Append current metrics to rolling snapshots, trim to last 48, return values closest to now-24h for each. Persisted; survives restarts."""
     now = datetime.now()
     cutoff_48h = now - timedelta(hours=48)
     target_24h = now - timedelta(hours=24)
-    snapshots = []
-    if HL_EQUITY_SNAPSHOTS_PATH.exists():
+    try:
+        eq = float(current_equity) if current_equity is not None else None
+    except (TypeError, ValueError):
+        eq = None
+    wr = None
+    if win_rate_pct is not None:
         try:
-            data = json.loads(HL_EQUITY_SNAPSHOTS_PATH.read_text())
+            wr = float(win_rate_pct)
+        except (TypeError, ValueError):
+            pass
+    sh = None
+    if sharpe_ratio is not None:
+        try:
+            sh = float(sharpe_ratio)
+        except (TypeError, ValueError):
+            pass
+    pf = None
+    if profit_factor is not None:
+        try:
+            pf = float(profit_factor)
+        except (TypeError, ValueError):
+            pass
+
+    snapshots = []
+    if DASHBOARD_SNAPSHOTS_PATH.exists():
+        try:
+            data = json.loads(DASHBOARD_SNAPSHOTS_PATH.read_text())
             snapshots = (data.get("snapshots") or []) if isinstance(data, dict) else []
         except Exception:
             snapshots = []
-    snapshots.append({"equity": round(eq, 2), "ts": now.isoformat()})
+    snapshots.append({
+        "ts": now.isoformat(),
+        "equity": round(eq, 2) if eq is not None else None,
+        "win_rate_pct": round(wr, 2) if wr is not None else None,
+        "sharpe_ratio": round(sh, 2) if sh is not None else None,
+        "profit_factor": round(pf, 2) if pf is not None else None,
+    })
     # Keep only last 48 and from last 48h
     parsed = []
     for s in snapshots:
@@ -320,25 +380,164 @@ def _equity_snapshot_update_and_get_24h(current_equity: Optional[float]) -> Opti
             if t.tzinfo:
                 t = t.replace(tzinfo=None)
             if t >= cutoff_48h:
-                parsed.append((t, float(s.get("equity", 0))))
+                parsed.append((t, s))
         except (ValueError, TypeError):
             continue
     parsed.sort(key=lambda x: x[0])
-    if len(parsed) > HL_EQUITY_SNAPSHOTS_MAX:
-        parsed = parsed[-HL_EQUITY_SNAPSHOTS_MAX:]
+    if len(parsed) > DASHBOARD_SNAPSHOTS_MAX:
+        parsed = parsed[-DASHBOARD_SNAPSHOTS_MAX:]
     try:
         CLAWD_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-        HL_EQUITY_SNAPSHOTS_PATH.write_text(
-            json.dumps({"snapshots": [{"equity": e, "ts": t.isoformat()} for t, e in parsed]}, separators=(",", ":"))
-        )
+        out_snapshots = [{"ts": t.isoformat(), "equity": s.get("equity"), "win_rate_pct": s.get("win_rate_pct"), "sharpe_ratio": s.get("sharpe_ratio"), "profit_factor": s.get("profit_factor")} for t, s in parsed]
+        DASHBOARD_SNAPSHOTS_PATH.write_text(json.dumps({"snapshots": out_snapshots}, separators=(",", ":")))
     except Exception:
         pass
-    # Value closest to target_24h (before or at 24h ago)
-    candidates = [(t, e) for t, e in parsed if t <= target_24h]
-    if not candidates:
+
+    def _get_24h_value(key: str) -> Optional[float]:
+        candidates = [(t, s.get(key)) for t, s in parsed if t <= target_24h and s.get(key) is not None]
+        if candidates:
+            best = min(candidates, key=lambda x: abs((x[0] - target_24h).total_seconds()))
+            try:
+                return round(float(best[1]), 2)
+            except (TypeError, ValueError):
+                return None
+        if len(parsed) >= 2:
+            first_val = parsed[0][1].get(key)
+            if first_val is not None:
+                try:
+                    return round(float(first_val), 2)
+                except (TypeError, ValueError):
+                    pass
         return None
-    best = min(candidates, key=lambda x: abs((x[0] - target_24h).total_seconds()))
-    return round(best[1], 2)
+
+    return {
+        "equity_24h_ago": _get_24h_value("equity"),
+        "win_rate_pct_24h_ago": _get_24h_value("win_rate_pct"),
+        "sharpe_ratio_24h_ago": _get_24h_value("sharpe_ratio"),
+        "profit_factor_24h_ago": _get_24h_value("profit_factor"),
+    }
+
+
+def _dashboard_daily_equity_update_and_get(current_equity: Optional[float]) -> List[Dict[str, Any]]:
+    """Update daily equity snapshots at UTC day boundaries and return daily PnL deltas."""
+    snapshots = []
+    if DASHBOARD_DAILY_EQUITY_PATH.exists():
+        try:
+            data = json.loads(DASHBOARD_DAILY_EQUITY_PATH.read_text())
+            snapshots = (data.get("snapshots") or []) if isinstance(data, dict) else []
+        except Exception:
+            snapshots = []
+
+    parsed = []
+    for s in snapshots:
+        if not isinstance(s, dict):
+            continue
+        day_str = s.get("day")
+        eq_raw = s.get("equity")
+        if not day_str:
+            continue
+        try:
+            day_dt = datetime.fromisoformat(day_str).date()
+        except (ValueError, TypeError):
+            continue
+        try:
+            eq_val = float(eq_raw)
+        except (TypeError, ValueError):
+            continue
+        parsed.append({"day": day_dt, "equity": round(eq_val, 2)})
+
+    parsed.sort(key=lambda x: x["day"])
+
+    eq_now = None
+    if current_equity is not None:
+        try:
+            eq_now = float(current_equity)
+        except (TypeError, ValueError):
+            eq_now = None
+
+    updated = False
+    if eq_now is not None:
+        today_utc = datetime.now(timezone.utc).date()
+        last_day = parsed[-1]["day"] if parsed else None
+        if last_day is None or last_day < today_utc:
+            parsed.append({"day": today_utc, "equity": round(eq_now, 2)})
+            updated = True
+
+    if updated:
+        if len(parsed) > DASHBOARD_DAILY_EQUITY_MAX:
+            parsed = parsed[-DASHBOARD_DAILY_EQUITY_MAX:]
+        try:
+            CLAWD_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+            out = [{"day": s["day"].isoformat(), "equity": s["equity"]} for s in parsed]
+            DASHBOARD_DAILY_EQUITY_PATH.write_text(json.dumps({"snapshots": out}, separators=(",", ":")))
+        except Exception:
+            pass
+
+    # Daily PnL: diff between consecutive UTC-midnight equity snapshots.
+    daily = []
+    for i in range(1, len(parsed)):
+        prev = parsed[i - 1]
+        cur = parsed[i]
+        pnl = round(cur["equity"] - prev["equity"], 2)
+        pnl_pct = None
+        if prev["equity"] and prev["equity"] > 0:
+            pnl_pct = round((pnl / prev["equity"]) * 100, 2)
+        daily.append({
+            "day": prev["day"].isoformat(),
+            "pnl_usd": pnl,
+            "pnl_pct": pnl_pct,
+        })
+    return daily
+
+
+def _dashboard_apr_apy(current_equity: Optional[float]) -> Dict[str, Optional[float]]:
+    """Compute 1d/7d/30d APR and 30d APY from daily equity snapshots. Returns pct values (e.g. 12.5 for 12.5%)."""
+    out = {"apr_1d_pct": None, "apr_7d_pct": None, "apr_30d_pct": None, "apy_30d_pct": None}
+    try:
+        eq_now = float(current_equity) if current_equity is not None else None
+    except (TypeError, ValueError):
+        eq_now = None
+    if eq_now is None or eq_now <= 0:
+        return out
+    snapshots = []
+    if DASHBOARD_DAILY_EQUITY_PATH.exists():
+        try:
+            data = json.loads(DASHBOARD_DAILY_EQUITY_PATH.read_text())
+            snapshots = (data.get("snapshots") or []) if isinstance(data, dict) else []
+        except Exception:
+            snapshots = []
+    by_day = {}
+    for s in snapshots:
+        if not isinstance(s, dict) or not s.get("day"):
+            continue
+        try:
+            day = datetime.fromisoformat(str(s["day"]).strip()).date()
+            eq = float(s.get("equity", 0))
+        except (ValueError, TypeError):
+            continue
+        if eq > 0:
+            by_day[day] = eq
+    today_utc = datetime.now(timezone.utc).date()
+
+    def equity_on_or_before(d):
+        if d in by_day:
+            return by_day[d]
+        for past in sorted(by_day.keys(), reverse=True):
+            if past <= d:
+                return by_day[past]
+        return None
+
+    eq_1d = equity_on_or_before(today_utc - timedelta(days=1))
+    eq_7d = equity_on_or_before(today_utc - timedelta(days=7))
+    eq_30d = equity_on_or_before(today_utc - timedelta(days=30))
+    if eq_1d and eq_1d > 0:
+        out["apr_1d_pct"] = round((eq_now / eq_1d - 1) * 365 * 100, 2)
+    if eq_7d and eq_7d > 0:
+        out["apr_7d_pct"] = round((eq_now / eq_7d - 1) * (365 / 7) * 100, 2)
+    if eq_30d and eq_30d > 0:
+        out["apr_30d_pct"] = round((eq_now / eq_30d - 1) * (365 / 30) * 100, 2)
+        out["apy_30d_pct"] = round((pow(eq_now / eq_30d, 365 / 30) - 1) * 100, 2)
+    return out
 
 
 def _trade_stats(trades: list) -> Dict[str, Any]:
@@ -428,9 +627,59 @@ def _trade_stats(trades: list) -> Dict[str, Any]:
     }
 
 
+def _enrich_last_trades_with_volume(perf: Dict[str, Any], last_trades: list) -> list:
+    """Add volume_usd (open+close) and notional_usd to file-based trades when missing, using signals[symbol].last_trades."""
+    if not last_trades or not isinstance(perf, dict):
+        return last_trades
+    signals = perf.get("signals") or {}
+    # Build key -> (volume_usd, notional_usd) from per-symbol last_trades (have entry, exit, qty)
+    by_key = {}
+    for sym, data in signals.items():
+        if not isinstance(data, dict):
+            continue
+        for t in (data.get("last_trades") or []):
+            if not isinstance(t, dict):
+                continue
+            try:
+                entry = float(t.get("entry") or 0)
+                exit_px = float(t.get("exit") or 0)
+                eq = float(t.get("entry_qty") or t.get("exit_qty") or 0)
+            except (TypeError, ValueError):
+                continue
+            if entry <= 0 or exit_px <= 0 or eq <= 0:
+                continue
+            vol = round(entry * eq + exit_px * eq, 2)
+            notional = round(exit_px * eq, 2)
+            time_str = (t.get("time") or "").strip()[:19]
+            pnl_str = str(t.get("pnl_usd", "")) if t.get("pnl_usd") is not None else ""
+            by_key[(sym, time_str, pnl_str)] = (vol, notional)
+    # Enrich global last_trades (copy so we don't mutate persisted data)
+    out = []
+    for t in last_trades:
+        if not isinstance(t, dict):
+            out.append(t)
+            continue
+        row = dict(t)
+        if row.get("volume_usd") is not None and row.get("notional_usd") is not None:
+            out.append(row)
+            continue
+        sym = (row.get("symbol") or "").strip()
+        time_str = (row.get("time") or "")[:19]
+        pnl_str = str(row.get("pnl_usd", "")) if row.get("pnl_usd") is not None else ""
+        for k in [(sym, time_str, pnl_str), (sym, time_str, "")]:
+            if k in by_key:
+                vol, notional = by_key[k]
+                row["volume_usd"] = vol
+                row["notional_usd"] = notional
+                break
+        out.append(row)
+    return out
+
+
 def _compute_summary(perf: Dict[str, Any], positions: Dict[str, Any]) -> Dict[str, Any]:
     last_10 = perf.get("last_10", []) if isinstance(perf, dict) else []
-    last_trades = perf.get("last_trades", []) if isinstance(perf, dict) else []
+    last_trades_raw = perf.get("last_trades", []) if isinstance(perf, dict) else []
+    last_trades = _enrich_last_trades_with_volume(perf, last_trades_raw)
     # Prefer win rate from actual closed-trade PnL (fixes wrong 100% when signals aggregates are off)
     total = won = lost = 0
     if last_trades:
@@ -463,15 +712,10 @@ def _compute_summary(perf: Dict[str, Any], positions: Dict[str, Any]) -> Dict[st
 
     open_positions = _extract_open_positions(positions)
     stats = _trade_stats(last_trades)
-    # 24h-ago stats: stats from trades closed before (now - 24h)
-    now = datetime.now()
-    cutoff_24h = now - timedelta(hours=24)
-    trades_24h = [t for t in (last_trades or []) if isinstance(t, dict) and _parse_trade_time(t) and _parse_trade_time(t) < cutoff_24h]
-    stats_24h = _trade_stats(trades_24h) if trades_24h else {}
-    ob_24h = (stats_24h.get("overview_breakdown") or {}).get("total") or {}
-    win_rate_pct_24h_ago = ob_24h.get("win_rate_pct")
-    sharpe_ratio_24h_ago = stats_24h.get("sharpe_ratio")
-    profit_factor_24h_ago = stats_24h.get("profit_factor")
+    # 24h-ago values come from rolling dashboard snapshots in get_portfolio_dashboard (persisted, survives restarts)
+    win_rate_pct_24h_ago = None
+    sharpe_ratio_24h_ago = None
+    profit_factor_24h_ago = None
     # When trade pnl_pct is missing, approximate largest win/loss % from equity
     try:
         eq = float(equity) if equity is not None else None
@@ -711,8 +955,25 @@ async def get_funding_oi():
     )
 
 
+def _get_performance_since() -> Optional[datetime]:
+    """Return the 'performance since' cutoff (only show trades closed on or after this time). Set by reset script."""
+    if not DASHBOARD_PERFORMANCE_SINCE_PATH.exists():
+        return None
+    try:
+        data = json.loads(DASHBOARD_PERFORMANCE_SINCE_PATH.read_text())
+        ts_str = (data or {}).get("ts")
+        if not ts_str:
+            return None
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        if dt.tzinfo:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
 def _merge_live_into_summary(summary: Dict[str, Any], live: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Overwrite equity, open_positions, and when available win rate from live exchange data."""
+    """Overwrite equity, open_positions, and when available win rate from live exchange data. If dashboard_performance_since is set, filter trades to that cutoff."""
     if not live or not isinstance(live, dict):
         return summary
     out = dict(summary)
@@ -721,26 +982,30 @@ def _merge_live_into_summary(summary: Dict[str, Any], live: Optional[Dict[str, A
     if "open_positions" in live and isinstance(live["open_positions"], list):
         out["open_positions"] = live["open_positions"]
         out["open_positions_count"] = len(live["open_positions"])
-    # Live win rate from exchange (e.g. HL user fills)
-    if "win_rate_pct" in live and live.get("win_rate_pct") is not None:
-        out["win_rate_pct"] = live["win_rate_pct"]
-    if "total_trades" in live and live.get("total_trades") is not None:
-        out["total_trades"] = live["total_trades"]
-    if "won" in live and live.get("won") is not None:
-        out["won"] = live["won"]
-    if "lost" in live and live.get("lost") is not None:
-        out["lost"] = live["lost"]
-    # Live last 10 trades from exchange (includes losing trades)
-    if "last_10_trades" in live and isinstance(live.get("last_10_trades"), list):
-        out["last_10_trades"] = live["last_10_trades"]
-    if "last_10_pnl_usd" in live and live.get("last_10_pnl_usd") is not None:
-        out["last_10_pnl_usd"] = live["last_10_pnl_usd"]
+    # When live provides all_trades: optionally filter to "performance since" (after reset), then set stats
     if "all_trades" in live and isinstance(live.get("all_trades"), list):
-        out["all_trades"] = live["all_trades"]
-        live_stats = _trade_stats(live["all_trades"])
+        since_dt = _get_performance_since()
+        all_trades = list(live["all_trades"])
+        last_10_trades = list(live.get("last_10_trades") or [])
+        if since_dt:
+            all_trades = [t for t in all_trades if isinstance(t, dict) and _parse_trade_time(t) and _parse_trade_time(t) >= since_dt]
+            last_10_trades = [t for t in last_10_trades if isinstance(t, dict) and _parse_trade_time(t) and _parse_trade_time(t) >= since_dt]
+            last_10_trades = sorted(last_10_trades, key=lambda x: (_parse_trade_time(x) or datetime.min), reverse=True)[:10]
+        out["all_trades"] = all_trades
+        live_stats = _trade_stats(all_trades)
+        # Copy aggregate stats from live trades (Sharpe, profit factor, overview breakdown, etc.)
         for k, v in live_stats.items():
             out[k] = v
-        # When pnl_pct missing, approximate largest win/loss % from equity
+        # Ensure top-level total_trades and win_rate_pct match the overview table (so cards and table stay in sync).
+        total_bucket = (live_stats.get("overview_breakdown") or {}).get("total") or {}
+        trades_count = total_bucket.get("trades")
+        if trades_count is not None:
+            out["total_trades"] = trades_count
+        win_rate_live = total_bucket.get("win_rate_pct")
+        if win_rate_live is not None:
+            out["win_rate_pct"] = win_rate_live
+        out["last_10_trades"] = last_10_trades
+        out["last_10_pnl_usd"] = round(sum(float(t.get("pnl_usd", 0) or 0) for t in last_10_trades if isinstance(t, dict)), 2)
         try:
             eq = float(out.get("equity")) if out.get("equity") is not None else None
         except (TypeError, ValueError):
@@ -753,12 +1018,30 @@ def _merge_live_into_summary(summary: Dict[str, Any], live: Optional[Dict[str, A
     return out
 
 
+def _filter_perf_by_since(perf: Dict[str, Any], since_dt: datetime) -> Dict[str, Any]:
+    """Return a copy of perf with last_trades and last_10 only including trades on or after since_dt."""
+    if not perf or not since_dt:
+        return perf
+    out = dict(perf)
+    for key in ("last_trades", "last_10"):
+        if key not in out or not isinstance(out[key], list):
+            continue
+        filtered = [t for t in out[key] if isinstance(t, dict) and _parse_trade_time(t) and _parse_trade_time(t) >= since_dt]
+        if key == "last_10":
+            filtered = sorted(filtered, key=lambda x: (_parse_trade_time(x) or datetime.min), reverse=True)[:10]
+        out[key] = filtered
+    return out
+
+
 @app.get("/portfolio")
 async def get_portfolio_dashboard():
     """Hyperliquid portfolio summary for dashboard. Uses live positions/equity when env is set."""
     try:
         hl_perf = _load_json(HL_PERF_PATH)
         hl_pos = _load_json(HL_POS_PATH)
+        since_dt = _get_performance_since()
+        if since_dt and hl_perf:
+            hl_perf = _filter_perf_by_since(hl_perf, since_dt)
         hl_summary = _compute_summary(hl_perf, hl_pos)
         if fetch_live_hyperliquid:
             try:
@@ -770,52 +1053,77 @@ async def get_portfolio_dashboard():
                 import traceback
                 print(f"⚠️  Live Hyperliquid fetch failed: {e}", flush=True)
                 traceback.print_exc()
-        # 24h-ago equity from snapshots (append current, return value closest to 24h ago)
-        equity_now = hl_summary.get("equity")
-        hl_summary["equity_24h_ago"] = _equity_snapshot_update_and_get_24h(equity_now)
-        return {
-            "ok": True,
-            "t": datetime.now().isoformat(),
-            "hyperliquid": hl_summary,
-        }
+        # Rolling 24h: append current metrics to persisted snapshots, get values closest to 24h ago (or oldest)
+        values_24h = _dashboard_snapshots_update_and_get_24h(
+            hl_summary.get("equity"),
+            hl_summary.get("win_rate_pct"),
+            hl_summary.get("sharpe_ratio"),
+            hl_summary.get("profit_factor"),
+        )
+        hl_summary["equity_24h_ago"] = values_24h.get("equity_24h_ago")
+        hl_summary["win_rate_pct_24h_ago"] = values_24h.get("win_rate_pct_24h_ago")
+        hl_summary["sharpe_ratio_24h_ago"] = values_24h.get("sharpe_ratio_24h_ago")
+        hl_summary["profit_factor_24h_ago"] = values_24h.get("profit_factor_24h_ago")
+        hl_summary["daily_pnl"] = _dashboard_daily_equity_update_and_get(hl_summary.get("equity"))
+        apr_apy = _dashboard_apr_apy(hl_summary.get("equity"))
+        hl_summary["apr_1d_pct"] = apr_apy.get("apr_1d_pct")
+        hl_summary["apr_7d_pct"] = apr_apy.get("apr_7d_pct")
+        hl_summary["apr_30d_pct"] = apr_apy.get("apr_30d_pct")
+        hl_summary["apy_30d_pct"] = apr_apy.get("apy_30d_pct")
+        return JSONResponse(
+            {
+                "ok": True,
+                "t": datetime.now().isoformat(),
+                "hyperliquid": hl_summary,
+            },
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
     except Exception as e:
         import traceback
         print(f"❌ Portfolio dashboard error: {e}", flush=True)
         traceback.print_exc()
-        return {
-            "ok": False,
-            "t": datetime.now().isoformat(),
-            "error": str(e),
-            "hyperliquid": {
-                "equity": None,
-                "open_positions": [],
-                "open_positions_count": 0,
-                "last_10_trades": [],
-                "all_trades": [],
-                "win_rate_pct": None,
-                "total_trades": 0,
-                "last_10_pnl_usd": None,
-                "avg_profit_usd": None,
-                "avg_loss_usd": None,
-                "avg_profit_pct": None,
-                "avg_loss_pct": None,
-                "pl_ratio": None,
-                "avg_total_pnl_usd": None,
-                "avg_pnl_longs_usd": None,
-                "avg_pnl_shorts_usd": None,
-                "sharpe_ratio": None,
-                "profit_factor": None,
-                "equity_24h_ago": None,
-                "win_rate_pct_24h_ago": None,
-                "sharpe_ratio_24h_ago": None,
-                "profit_factor_24h_ago": None,
-                "largest_win_usd": None,
-                "largest_loss_usd": None,
-                "largest_win_pct": None,
-                "largest_loss_pct": None,
-                "overview_breakdown": None,
+        return JSONResponse(
+            {
+                "ok": False,
+                "t": datetime.now().isoformat(),
+                "error": str(e),
+                "hyperliquid": {
+                    "equity": None,
+                    "open_positions": [],
+                    "open_positions_count": 0,
+                    "last_10_trades": [],
+                    "all_trades": [],
+                    "win_rate_pct": None,
+                    "total_trades": 0,
+                    "last_10_pnl_usd": None,
+                    "avg_profit_usd": None,
+                    "avg_loss_usd": None,
+                    "avg_profit_pct": None,
+                    "avg_loss_pct": None,
+                    "pl_ratio": None,
+                    "avg_total_pnl_usd": None,
+                    "avg_pnl_longs_usd": None,
+                    "avg_pnl_shorts_usd": None,
+                    "sharpe_ratio": None,
+                    "profit_factor": None,
+                    "equity_24h_ago": None,
+                    "win_rate_pct_24h_ago": None,
+                    "sharpe_ratio_24h_ago": None,
+                    "profit_factor_24h_ago": None,
+                    "largest_win_usd": None,
+                    "largest_loss_usd": None,
+                    "largest_win_pct": None,
+                    "largest_loss_pct": None,
+                    "overview_breakdown": None,
+                    "daily_pnl": [],
+                    "apr_1d_pct": None,
+                    "apr_7d_pct": None,
+                    "apr_30d_pct": None,
+                    "apy_30d_pct": None,
+                },
             },
-        }
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
 
 @app.get("/portfolio-dashboard", response_class=HTMLResponse)
@@ -857,9 +1165,29 @@ async def portfolio_dashboard():
     .diff-24h.danger { color: var(--danger); }
     .diff-24h.muted { color: var(--muted); }
     .section-title { font-size: 16px; margin: 4px 0 0; }
+    .overview-grid { display: grid; gap: 14px; margin-top: 10px; grid-template-columns: minmax(240px, 0.8fr) minmax(320px, 1.2fr); align-items: start; }
+    @media (max-width: 900px) { .overview-grid { grid-template-columns: 1fr; } }
+    .calendar-panel { display: flex; flex-direction: column; gap: 8px; min-height: 260px; }
+    .calendar-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .calendar-title { font-size: 14px; font-weight: 600; }
+    .calendar-controls { display: flex; align-items: center; gap: 8px; }
+    .calendar-btn { background: #0f1726; border: 1px solid #1f2a3c; color: var(--text); border-radius: 6px; padding: 2px 8px; font-size: 12px; cursor: pointer; }
+    .calendar-btn:disabled { opacity: 0.45; cursor: default; }
+    .calendar-month { font-size: 12px; color: var(--muted); }
+    .calendar-weekdays, .calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+    .calendar-weekday { font-size: 10px; text-transform: uppercase; color: var(--muted); text-align: center; }
+    .calendar-cell { border: 1px solid #1f2a3c; border-radius: 8px; padding: 6px; min-height: 62px; background: #0f1726; display: flex; flex-direction: column; gap: 2px; }
+    .calendar-cell.empty { background: transparent; border: 1px dashed #1f2a3c; }
+    .calendar-day { font-size: 11px; color: var(--muted); }
+    .calendar-value { font-size: 12px; font-weight: 600; }
+    .calendar-pct { font-size: 10px; color: var(--muted); }
+    .calendar-cell.positive { background: rgba(56, 211, 159, 0.12); border-color: rgba(56, 211, 159, 0.35); }
+    .calendar-cell.negative { background: rgba(255, 122, 122, 0.12); border-color: rgba(255, 122, 122, 0.35); }
+    .calendar-cell.neutral { background: rgba(138, 160, 181, 0.08); }
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
     th, td { padding: 8px; border-bottom: 1px solid #1f2a3c; text-align: left; }
     th { color: var(--muted); font-weight: 600; }
+    .panel table thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
     .pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; display: inline-block; }
     .pill.long { background: rgba(56, 211, 159, 0.12); color: var(--success); }
     .pill.short { background: rgba(255, 122, 122, 0.12); color: var(--danger); }
@@ -920,16 +1248,30 @@ async def portfolio_dashboard():
       <h2>Hyperliquid</h2>
       <div class="grid cards" id="hl-cards"></div>
       <div class="section-title">Overview</div>
-      <div class="panel" style="margin-top:10px; overflow-x:auto;">
-        <table class="overview-table">
-          <thead>
-            <tr><th>Type</th><th>Total</th><th>Longs</th><th>Shorts</th></tr>
-          </thead>
-          <tbody id="hl-overview"></tbody>
-        </table>
+      <div class="overview-grid">
+        <div class="panel" style="overflow-x:auto;">
+          <table class="overview-table">
+            <thead>
+              <tr><th>Type</th><th>Total</th></tr>
+            </thead>
+            <tbody id="hl-overview"></tbody>
+          </table>
+        </div>
+        <div class="panel calendar-panel">
+          <div class="calendar-header">
+            <div class="calendar-title">PnL Calendar</div>
+            <div class="calendar-controls">
+              <button class="calendar-btn" id="pnl-calendar-prev" aria-label="Previous month">‹</button>
+              <div class="calendar-month" id="pnl-calendar-label">—</div>
+              <button class="calendar-btn" id="pnl-calendar-next" aria-label="Next month">›</button>
+            </div>
+          </div>
+          <div class="calendar-weekdays" id="pnl-calendar-weekdays"></div>
+          <div class="calendar-grid" id="pnl-calendar-grid"></div>
+        </div>
       </div>
       <div class="section-title">Open Positions (Live)</div>
-      <div class="panel" style="margin-top:10px;">
+      <div class="panel" style="margin-top:10px; max-height:320px; overflow-y:auto;">
         <table>
           <thead>
             <tr>
@@ -951,17 +1293,17 @@ async def portfolio_dashboard():
 
     let _prevCards = null;
     const renderCards = (root, data, labelPrefix="") => {
-      const cardKeys = ["equity", "win_rate_pct", "total_trades", "open_positions_count", "sharpe_ratio", "profit_factor", "largest_win_pct", "largest_loss_pct"];
-      const rawValues = [data.equity, data.win_rate_pct, data.total_trades, data.open_positions_count, data.sharpe_ratio, data.profit_factor, data.largest_win_pct, data.largest_loss_pct];
+      const cardKeys = ["equity", "win_rate_pct", "apr_1d_pct", "apr_7d_pct", "apr_30d_pct", "apy_30d_pct", "sharpe_ratio", "profit_factor"];
+      const rawValues = [data.equity, data.win_rate_pct, data.apr_1d_pct, data.apr_7d_pct, data.apr_30d_pct, data.apy_30d_pct, data.sharpe_ratio, data.profit_factor];
       const cards = [
         { key: "equity", label: `${labelPrefix}Equity`, value: data.equity ?? "—", money: true, show24h: true, prevKey: "equity_24h_ago" },
-        { key: "win_rate_pct", label: `${labelPrefix}Win Rate`, value: fmtPct(data.win_rate_pct), show24h: true, prevKey: "win_rate_pct_24h_ago" },
-        { key: "total_trades", label: `${labelPrefix}Trades`, value: data.total_trades ?? 0 },
-        { key: "open_positions_count", label: `${labelPrefix}Open Positions`, value: data.open_positions_count ?? 0 },
-        { key: "sharpe_ratio", label: `${labelPrefix}Sharpe Ratio`, value: data.sharpe_ratio ?? "—", number: true, show24h: true, prevKey: "sharpe_ratio_24h_ago" },
-        { key: "profit_factor", label: `${labelPrefix}Profit Factor`, value: data.profit_factor ?? "—", number: true, show24h: true, prevKey: "profit_factor_24h_ago" },
-        { key: "largest_win_pct", label: `${labelPrefix}Largest Win`, value: data.largest_win_pct ?? "—", pct: true, pnlPositive: true },
-        { key: "largest_loss_pct", label: `${labelPrefix}Largest Loss`, value: data.largest_loss_pct ?? "—", pct: true, pnlNegative: true },
+        { key: "win_rate_pct", label: `${labelPrefix}Win Rate`, value: fmtPct(data.win_rate_pct), show24h: true, prevKey: "win_rate_pct_24h_ago", tooltip: "Percentage of closed trades that were profitable (winners ÷ total trades)." },
+        { key: "apr_1d_pct", label: `${labelPrefix}1d APR`, value: data.apr_1d_pct, pctSigned: true, tooltip: "Annualized return from 1-day equity change." },
+        { key: "apr_7d_pct", label: `${labelPrefix}7d APR`, value: data.apr_7d_pct, pctSigned: true, tooltip: "Annualized return from 7-day equity change." },
+        { key: "apr_30d_pct", label: `${labelPrefix}30d APR`, value: data.apr_30d_pct, pctSigned: true, tooltip: "Annualized return from 30-day equity change." },
+        { key: "apy_30d_pct", label: `${labelPrefix}30d APY`, value: data.apy_30d_pct, pctSigned: true, tooltip: "Annualized compounded return (30-day period)." },
+        { key: "sharpe_ratio", label: `${labelPrefix}Sharpe Ratio`, value: data.sharpe_ratio ?? "—", number: true, show24h: true, prevKey: "sharpe_ratio_24h_ago", tooltip: "Risk-adjusted return: average PnL per trade ÷ standard deviation of PnL. Higher is better; above 1 is often considered good." },
+        { key: "profit_factor", label: `${labelPrefix}Profit Factor`, value: data.profit_factor ?? "—", number: true, show24h: true, prevKey: "profit_factor_24h_ago", tooltip: "Gross profit ÷ gross loss from closed trades. Above 1 means total profits exceed total losses." },
       ];
       const diff24h = (cur, prev, key) => {
         if (cur == null || prev == null || prev === "" || prev === "—") return null;
@@ -975,15 +1317,19 @@ async def portfolio_dashboard():
         return { pct, positive: pct >= 0 };
       };
       root.innerHTML = cards.map((c, i) => {
-        const numVal = (c.pnl || c.money || c.number || c.pct) && c.value !== "—" && c.value != null ? Number(c.value) : null;
+        const numVal = (c.pnl || c.money || c.number || c.pct || c.pctSigned) && c.value !== "—" && c.value != null ? Number(c.value) : null;
         let cls = "";
         if (c.pnl) cls = numVal != null && numVal >= 0 ? "success" : "danger";
         else if (c.pnlPositive && numVal != null) cls = "success";
         else if (c.pnlNegative && numVal != null) cls = "danger";
+        else if (c.pctSigned && numVal != null) cls = numVal >= 0 ? "success" : "danger";
         let display = c.value;
         if (c.pct) {
           if (numVal != null) display = (numVal >= 0 ? "+" : "") + Number(numVal).toFixed(2) + "%";
           else display = c.value;
+        } else if (c.pctSigned) {
+          if (numVal != null) display = (numVal >= 0 ? "+" : "") + Number(numVal).toFixed(2) + "%";
+          else display = "—";
         } else if (c.pnl || c.money) {
           if (numVal != null) display = (numVal >= 0 ? "+$" : "-$") + Math.abs(numVal).toFixed(2);
           else if (c.money && typeof c.value === "string" && c.value.includes("$")) display = c.value;
@@ -1003,14 +1349,24 @@ async def portfolio_dashboard():
           if (d != null) {
             const sign = d.positive ? "+" : "";
             const diffCls = d.positive ? "success" : "danger";
-            diffLine = `<div class="diff-24h ${diffCls}">${sign}${d.pct.toFixed(2)}% (24h)</div>`;
+            let text = `${sign}${d.pct.toFixed(2)}% (24h)`;
+            if (c.key === "equity" && curRaw != null && prevRaw != null) {
+              const curN = Number(curRaw), prevN = Number(prevRaw);
+              if (!isNaN(curN) && !isNaN(prevN)) {
+                const delta = curN - prevN;
+                const deltaStr = (delta >= 0 ? "+$" : "-$") + Math.abs(delta).toFixed(2);
+                text = `${sign}${d.pct.toFixed(2)}% (${deltaStr}) (24h)`;
+              }
+            }
+            diffLine = `<div class="diff-24h ${diffCls}">${text}</div>`;
           } else {
             diffLine = `<div class="diff-24h muted">— (24h)</div>`;
           }
         }
-        return `<div class="panel card${flash}"><div class="label">${c.label}</div><div class="value ${cls}">${display}</div>${diffLine}</div>`;
+        const labelTitle = c.tooltip ? ` title="${c.tooltip.replace(/"/g, '&quot;')}"` : "";
+        return `<div class="panel card${flash}"><div class="label"${labelTitle}>${c.label}</div><div class="value ${cls}">${display}</div>${diffLine}</div>`;
       }).join("");
-      _prevCards = { equity: data.equity, win_rate_pct: data.win_rate_pct, total_trades: data.total_trades, open_positions_count: data.open_positions_count, sharpe_ratio: data.sharpe_ratio, profit_factor: data.profit_factor, largest_win_pct: data.largest_win_pct, largest_loss_pct: data.largest_loss_pct };
+      _prevCards = { equity: data.equity, win_rate_pct: data.win_rate_pct, apr_1d_pct: data.apr_1d_pct, apr_7d_pct: data.apr_7d_pct, apr_30d_pct: data.apr_30d_pct, apy_30d_pct: data.apy_30d_pct, sharpe_ratio: data.sharpe_ratio, profit_factor: data.profit_factor };
       setTimeout(() => { root.querySelectorAll(".flash-up, .flash-down").forEach(el => el.classList.remove("flash-up", "flash-down")); }, 1400);
     };
 
@@ -1034,27 +1390,25 @@ async def portfolio_dashboard():
     const renderOverviewTable = (root, breakdown) => {
       if (!root) return;
       if (!breakdown || !breakdown.total) {
-        root.innerHTML = "<tr><td class=\\"muted\\" colspan=\\"4\\">No trade data</td></tr>";
+        root.innerHTML = "<tr><td class=\\"muted\\" colspan=\\"2\\">No trade data</td></tr>";
         _prevBreakdown = null;
         return;
       }
       const T = breakdown.total;
-      const L = breakdown.longs || {};
-      const S = breakdown.shorts || {};
       const rows = [
-        { type: "Trades", total: T.trades, longs: L.trades, shorts: S.trades, kind: "int" },
-        { type: "Volume", total: T.volume_usd, longs: L.volume_usd, shorts: S.volume_usd, kind: "money" },
-        { type: "Winners", total: T.winners, longs: L.winners, shorts: S.winners, kind: "int" },
-        { type: "Losers", total: T.losers, longs: L.losers, shorts: S.losers, kind: "int" },
-        { type: "Win Rate", total: T.win_rate_pct, longs: L.win_rate_pct, shorts: S.win_rate_pct, kind: "pct_plain" },
-        { type: "Avg PnL", total: T.avg_pnl_usd, longs: L.avg_pnl_usd, shorts: S.avg_pnl_usd, kind: "money" },
-        { type: "Avg Profit", total: T.avg_profit_usd, longs: L.avg_profit_usd, shorts: S.avg_profit_usd, kind: "money" },
-        { type: "Avg Loss", total: T.avg_loss_usd, longs: L.avg_loss_usd, shorts: S.avg_loss_usd, kind: "money" },
-        { type: "Avg Profit %", total: T.avg_profit_pct, longs: L.avg_profit_pct, shorts: S.avg_profit_pct, kind: "pct" },
-        { type: "Avg Loss %", total: T.avg_loss_pct, longs: L.avg_loss_pct, shorts: S.avg_loss_pct, kind: "pct" },
-        { type: "P/L Ratio", total: T.pl_ratio, longs: L.pl_ratio, shorts: S.pl_ratio, kind: "pl_ratio" },
-        { type: "Total PnL", total: T.total_pnl_usd, longs: L.total_pnl_usd, shorts: S.total_pnl_usd, kind: "money" },
-        { type: "PnL%", total: T.pnl_pct, longs: null, shorts: null, kind: "pct" },
+        { type: "Trades", total: T.trades, kind: "int" },
+        { type: "Volume", total: T.volume_usd, kind: "money" },
+        { type: "Winners", total: T.winners, kind: "int" },
+        { type: "Losers", total: T.losers, kind: "int" },
+        { type: "Win Rate", total: T.win_rate_pct, kind: "pct_plain" },
+        { type: "Avg PnL", total: T.avg_pnl_usd, kind: "money" },
+        { type: "Avg Profit", total: T.avg_profit_usd, kind: "money" },
+        { type: "Avg Loss", total: T.avg_loss_usd, kind: "money" },
+        { type: "Avg Profit %", total: T.avg_profit_pct, kind: "pct" },
+        { type: "Avg Loss %", total: T.avg_loss_pct, kind: "pct" },
+        { type: "P/L Ratio", total: T.pl_ratio, kind: "pl_ratio" },
+        { type: "Total PnL", total: T.total_pnl_usd, kind: "money" },
+        { type: "PnL%", total: T.pnl_pct, kind: "pct" },
       ];
       const prev = _prevBreakdown;
       root.innerHTML = rows.map(r => {
@@ -1069,22 +1423,94 @@ async def portfolio_dashboard():
         const flash = (cur, col) => {
           if (!prev || !prev.rowsByType) return "";
           const prevRow = prev.rowsByType[r.type];
-          const prevVal = prevRow ? (col === "total" ? prevRow.total : col === "longs" ? prevRow.longs : prevRow.shorts) : null;
+          const prevVal = prevRow ? prevRow.total : null;
           const p = numFrom(prevVal);
           const c = numFrom(cur);
           if (p != null && c != null && p !== c) return c > p ? " flash-up" : " flash-down";
           return "";
         };
-        const tdCls = (v, k, col) => (cellCls(v, k) + flash(v, col)).trim();
+        const tdCls = (v, k) => (cellCls(v, k) + flash(v, "total")).trim();
         return "<tr>" +
           "<td class=\\"muted\\">" + r.type + "</td>" +
-          "<td class='" + tdCls(r.total, r.kind, "total") + "'>" + fmt(r.total) + "</td>" +
-          "<td class='" + tdCls(r.longs, r.kind, "longs") + "'>" + fmt(r.longs) + "</td>" +
-          "<td class='" + tdCls(r.shorts, r.kind, "shorts") + "'>" + fmt(r.shorts) + "</td>" +
+          "<td class='" + tdCls(r.total, r.kind) + "'>" + fmt(r.total) + "</td>" +
           "</tr>";
       }).join("");
-      _prevBreakdown = { total: T, longs: L, shorts: S, rowsByType: rows.reduce((acc, r) => { acc[r.type] = { total: r.total, longs: r.longs, shorts: r.shorts }; return acc; }, {}) };
+      _prevBreakdown = { total: T, rowsByType: rows.reduce((acc, r) => { acc[r.type] = { total: r.total }; return acc; }, {}) };
       setTimeout(() => { root.querySelectorAll(".flash-up, .flash-down").forEach(el => el.classList.remove("flash-up", "flash-down")); }, 1400);
+    };
+
+    const renderPnlCalendar = (dailyPnl) => {
+      const grid = document.getElementById("pnl-calendar-grid");
+      const weekdays = document.getElementById("pnl-calendar-weekdays");
+      const label = document.getElementById("pnl-calendar-label");
+      const prevBtn = document.getElementById("pnl-calendar-prev");
+      const nextBtn = document.getElementById("pnl-calendar-next");
+      if (!grid || !weekdays || !label || !prevBtn || !nextBtn) return;
+      if (!weekdays.dataset.init) {
+        const names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        weekdays.innerHTML = names.map(n => `<div class="calendar-weekday">${n}</div>`).join("");
+        weekdays.dataset.init = "1";
+      }
+      const pad = (n) => String(n).padStart(2, "0");
+      const toKeyUTC = (d) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+      const stats = { byDay: {}, latestDate: null };
+      const entries = Array.isArray(dailyPnl) ? dailyPnl : [];
+      for (const e of entries) {
+        if (!e || !e.day) continue;
+        const dayStr = String(e.day);
+        const dt = new Date(dayStr + "T00:00:00Z");
+        if (isNaN(dt.getTime())) continue;
+        if (!stats.latestDate || dt > stats.latestDate) stats.latestDate = dt;
+        const pnl = e.pnl_usd != null ? Number(e.pnl_usd) : null;
+        const pct = e.pnl_pct != null ? Number(e.pnl_pct) : null;
+        stats.byDay[dayStr] = { pnl, pct };
+      }
+      if (!window.__pnlCalendarMonth) {
+        const base = stats.latestDate || new Date();
+        window.__pnlCalendarMonth = { y: base.getUTCFullYear(), m: base.getUTCMonth() };
+      }
+      const year = window.__pnlCalendarMonth.y;
+      const month = window.__pnlCalendarMonth.m;
+      const monthLabel = new Date(Date.UTC(year, month, 1)).toLocaleString(undefined, { month: "long", year: "numeric", timeZone: "UTC" });
+      label.textContent = monthLabel;
+      const shiftMonth = (delta) => {
+        const d = new Date(Date.UTC(window.__pnlCalendarMonth.y, window.__pnlCalendarMonth.m + delta, 1));
+        window.__pnlCalendarMonth = { y: d.getUTCFullYear(), m: d.getUTCMonth() };
+      };
+      prevBtn.onclick = () => { shiftMonth(-1); renderPnlCalendar(dailyPnl); };
+      nextBtn.onclick = () => { shiftMonth(1); renderPnlCalendar(dailyPnl); };
+      const first = new Date(Date.UTC(year, month, 1));
+      const startDow = first.getUTCDay();
+      const daysInMonth = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+      const cells = [];
+      for (let i = 0; i < startDow; i++) {
+        cells.push(`<div class="calendar-cell empty"></div>`);
+      }
+      const fmtSignedMoney = (v) => (v >= 0 ? "+$" : "-$") + Math.abs(v).toFixed(2);
+      for (let day = 1; day <= daysInMonth; day++) {
+        const key = `${year}-${pad(month + 1)}-${pad(day)}`;
+        const entry = stats.byDay[key];
+        const pnl = entry && entry.pnl != null ? entry.pnl : null;
+        const pct = entry && entry.pct != null ? entry.pct : null;
+        const hasData = pnl != null && !isNaN(pnl);
+        const cls = hasData ? (pnl > 0 ? "positive" : pnl < 0 ? "negative" : "neutral") : "neutral";
+        const pnlText = hasData ? fmtSignedMoney(pnl) : "—";
+        const pctText = (pct != null && !isNaN(pct)) ? ((pct >= 0 ? "+" : "") + pct.toFixed(2) + "%") : "—";
+        cells.push(
+          `<div class="calendar-cell ${cls}">` +
+          `<div class="calendar-day">${day}</div>` +
+          `<div class="calendar-value">${pnlText}</div>` +
+          `<div class="calendar-pct">${pctText}</div>` +
+          `</div>`
+        );
+      }
+      const remainder = cells.length % 7;
+      if (remainder !== 0) {
+        for (let i = remainder; i < 7; i++) {
+          cells.push(`<div class="calendar-cell empty"></div>`);
+        }
+      }
+      grid.innerHTML = cells.join("");
     };
 
     const renderPositions = (root, positions) => {
@@ -1211,7 +1637,8 @@ async def portfolio_dashboard():
           segmentPaths += "<path d=\\"M " + x0 + "," + y0 + " L " + x1 + "," + y1 + "\\" class=\\"" + lineClass + "\\"/>";
           segmentAreas += "<path d=\\"M " + x0 + "," + zeroY + " L " + x0 + "," + y0 + " L " + x1 + "," + y1 + " L " + x1 + "," + zeroY + " Z\\" class=\\"" + areaClass + "\\"/>";
         }
-        const showValueLabels = count <= 25;
+        // Value labels on each point clutter the chart; rely on hover tooltips instead.
+        const showValueLabels = false;
         const xStep = count > 20 ? Math.max(1, Math.floor(count / 14)) : 1;
         const dayKey = (t) => t && t.time ? (d => d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate())(new Date(t.time)) : "";
         const fmtXLabel = (trade) => !trade || !trade.time ? "" : (d => d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: d.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined }))(new Date(trade.time));
@@ -1312,12 +1739,13 @@ async def portfolio_dashboard():
     async function load() {
       const updatedEl = document.getElementById("updated");
       try {
-        const res = await fetch("/portfolio");
+        const res = await fetch("/portfolio?_t=" + Date.now());
         if (!res.ok) {
           updatedEl.textContent = "Error: HTTP " + res.status + " — check server";
           renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), []);
           renderCards(document.getElementById("hl-cards"), {});
           renderOverviewTable(document.getElementById("hl-overview"), null);
+          renderPnlCalendar([]);
           renderPositions(document.getElementById("hl-positions"), []);
           return;
         }
@@ -1339,6 +1767,7 @@ async def portfolio_dashboard():
           renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), chartTrades);
           renderCards(document.getElementById("hl-cards"), hl);
           renderOverviewTable(document.getElementById("hl-overview"), hl.overview_breakdown || null);
+          renderPnlCalendar(hl.daily_pnl || []);
           renderPositions(document.getElementById("hl-positions"), hl.open_positions || []);
           return;
         }
@@ -1348,12 +1777,14 @@ async def portfolio_dashboard():
         renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), chartTrades);
         renderCards(document.getElementById("hl-cards"), hl);
         renderOverviewTable(document.getElementById("hl-overview"), hl.overview_breakdown || null);
+        renderPnlCalendar(hl.daily_pnl || []);
         renderPositions(document.getElementById("hl-positions"), hl.open_positions || []);
       } catch (err) {
         updatedEl.textContent = "Error: " + (err.message || "failed to load");
         renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), []);
         renderCards(document.getElementById("hl-cards"), {});
         renderOverviewTable(document.getElementById("hl-overview"), null);
+        renderPnlCalendar([]);
         renderPositions(document.getElementById("hl-positions"), []);
       }
     }
@@ -1364,7 +1795,7 @@ async def portfolio_dashboard():
 </body>
 </html>
 """
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store, max-age=0"})
 
 @app.get("/")
 async def root():

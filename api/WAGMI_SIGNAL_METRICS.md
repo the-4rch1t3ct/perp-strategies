@@ -1,6 +1,6 @@
-# Wagmi Trading Signal API — Metric Logic (Aster / Batch)
+# Wagmi Trading Signal API — Metric Logic (Batch)
 
-This document explains how the batch API (`/api/trade/batch`, `/api/trade/batch/aster`, `/api/trade/batch/hyperliquid`) computes **conf**, **rr**, **entry**, **tp**, **sl**, and **dir** so you can verify correctness or debug.
+This document explains how the batch API (`/api/trade/batch`, `/api/trade/batch/hyperliquid`) computes **conf**, **rr**, **entry**, **tp**, **sl**, and **dir** so you can verify correctness or debug.
 
 ---
 
@@ -28,9 +28,6 @@ strength = min(1.0, sqrt((oi_per_tier / total_oi_usd) * 3))
   This mirrors the Binance tier formula but uses actual HL OI in USD.
 - Fallback (if total OI unavailable):  
   `0.3 + 0.7 * sqrt(oi_usd / 5_000_000)`
-
-**Aster batch:**  
-- Clusters from Binance or Hyperliquid only (no synthetic). Conf comes from whichever source is used for that symbol.
 
 ### Interpretation
 
@@ -73,7 +70,7 @@ So: **rr = reward / risk**. It is **not** (TP−Entry)/(Entry−SL) in a differe
 ## 3. ENTRY PRICE
 
 - **Entry is always the current market price** at signal-build time (the “reference” price for that request).
-- For Aster batch, that is the **mark price** (or last price) from Aster (`/fapi/v1/ticker/price` or `premiumIndex.markPrice`).
+- For Hyperliquid batch, that is the **mark price** from HL (metaAndAssetCtxs).
 - It is **not** a separate “recommended” level; it is the price used as reference for TP/SL and rr.
 - **It should match** the top-level `price` field for that symbol in the batch response: both come from the same source (e.g. `current_prices[symbol]` for Aster).
 
@@ -133,13 +130,13 @@ So TP is derived from the **long** cluster’s price (slightly below it).
 ### What drives “market conditions”
 
 - **Main/Hyperliquid:** Real liquidation clusters (OI-based levels above/below price). Direction is “where is the nearest strong cluster we can trade toward?”
-- **Aster:** Synthetic levels at ±0.5% from mark. So you always have one “support” and one “resistance”; which direction is returned depends on strength/distance filters and the LONG-first priority. With the fixed 0.6 strength and 0.5% distance, both directions typically qualify; you will usually see LONG (first in code).
+ (Removed Aster-specific note.) “support” and one “resistance”; which direction is returned depends on strength/distance filters and the LONG-first priority. With the fixed 0.6 strength and 0.5% distance, both directions typically qualify; you will usually see LONG (first in code).
 
 ---
 
 ## Quick verification checklist
 
-1. **conf** — Equals the chosen cluster’s `strength`. For Aster batch, always 0.6 when not NEUTRAL.
+1. **conf** — Equals the chosen cluster’s `strength`.
 2. **rr** — `(reward in price units) / (risk in price units)`; LONG: (tp−entry)/(entry−sl); SHORT: (entry−tp)/(sl−entry).
 3. **entry** — Same as `results[symbol].price`; current/mark price at request time.
 4. **TP/SL** — LONG: SL &lt; entry &lt; TP; SHORT: TP &lt; entry &lt; SL.

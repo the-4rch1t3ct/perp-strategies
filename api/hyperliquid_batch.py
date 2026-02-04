@@ -17,6 +17,15 @@ from predictive_liquidation_heatmap import LiquidationLevel
 
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 
+# Funding → positioning controls (keep centralized for consistency)
+FUNDING_RATIO_MULTIPLIER = 1000.0
+FUNDING_EXTREME_THRESHOLD = 0.000035
+FUNDING_SMOOTH_ALPHA = 0.5
+_FUNDING_SMOOTH_CACHE: Dict[str, float] = {}
+FUNDING_TREND_WINDOW = 3
+FUNDING_TREND_EPS = 0.000003
+_FUNDING_TREND_HISTORY: Dict[str, List[float]] = {}
+
 # Map to Hyperliquid coin names (strip USDT). Includes Aster batch symbols.
 SYMBOL_TO_COIN: Dict[str, str] = {
     "ETHUSDT": "ETH",
@@ -52,18 +61,18 @@ SYMBOL_TO_COIN: Dict[str, str] = {
     # Tier 5 - High-Volume Meme Coins
     "PEPEUSDT": "PEPE",
     "WIFUSDT": "WIF",
-    "MYROUSDT": "MYRO",
     # Batch 2 - Additional High-Quality Assets
     # Tier 1 - Major Coins
     "ETCUSDT": "ETC",
     "ALGOUSDT": "ALGO",
     "NEARUSDT": "NEAR",
-    "FTMUSDT": "FTM",
     "ICPUSDT": "ICP",
+    "FILUSDT": "FIL",   # Filecoin (replaces FTM - not available for perp)
+    "JTOUSDT": "JTO",   # Jupiter (replaces MYRO - not available for perp)
+    "RUNEUSDT": "RUNE", # THORChain (replaces MKR - not available for perp)
     # Tier 2 - DeFi Tokens
     "AAVEUSDT": "AAVE",
     "COMPUSDT": "COMP",
-    "MKRUSDT": "MKR",
     "CRVUSDT": "CRV",
     "SNXUSDT": "SNX",
     "GMXUSDT": "GMX",
@@ -88,6 +97,46 @@ def _pct_dist(price: float, mid: float) -> float:
     if not mid or mid <= 0:
         return 0.0
     return abs(price - mid) / mid * 100.0
+
+
+def _smooth_funding_rate(symbol: str, funding_rate: Optional[float]) -> Optional[float]:
+    """EMA smoothing for funding rate to reduce noise and flicker."""
+    if funding_rate is None:
+        return None
+    try:
+        current = float(funding_rate)
+    except (TypeError, ValueError):
+        return None
+    prev = _FUNDING_SMOOTH_CACHE.get(symbol)
+    if prev is None:
+        _FUNDING_SMOOTH_CACHE[symbol] = current
+        return current
+    smoothed = (FUNDING_SMOOTH_ALPHA * current) + ((1.0 - FUNDING_SMOOTH_ALPHA) * prev)
+    _FUNDING_SMOOTH_CACHE[symbol] = smoothed
+    return smoothed
+
+
+def _update_funding_trend(symbol: str, funding_rate: Optional[float]) -> tuple:
+    """Track funding trend using a short rolling window of smoothed values."""
+    if funding_rate is None:
+        return ("FLAT", 0.0, 0.0)
+    try:
+        current = float(funding_rate)
+    except (TypeError, ValueError):
+        return ("FLAT", 0.0, 0.0)
+    history = _FUNDING_TREND_HISTORY.setdefault(symbol, [])
+    history.append(current)
+    if len(history) > FUNDING_TREND_WINDOW:
+        history.pop(0)
+    if len(history) < 2:
+        return ("FLAT", 0.0, 0.0)
+    delta = history[-1] - history[0]
+    if abs(delta) < FUNDING_TREND_EPS:
+        trend = "FLAT"
+    else:
+        trend = "UP" if delta > 0 else "DOWN"
+    strength = min(1.0, abs(delta) / FUNDING_EXTREME_THRESHOLD) if FUNDING_EXTREME_THRESHOLD > 0 else 0.0
+    return (trend, delta, strength)
 
 
 def fetch_hyperliquid_meta_and_ctx() -> Optional[tuple]:
@@ -115,10 +164,81 @@ def fetch_hyperliquid_meta_and_ctx() -> Optional[tuple]:
 
 
 def _strength_from_oi_share(oi_usd: float, total_oi_usd: float) -> float:
-    """Strength from OI share across all HL symbols (real OI distribution)."""
+    """Base strength from OI share across all HL symbols (market share component)."""
     if not total_oi_usd or total_oi_usd <= 0 or oi_usd <= 0:
         return 0.0
     return min(1.0, sqrt((oi_usd / total_oi_usd) * 3.0))
+
+
+def _relative_strength_from_oi_concentration(oi_usd: float, mark_px: float = 0.0) -> float:
+    """
+    Relative strength based on coin-specific metrics (allows smaller coins to qualify).
+    
+    This measures OI concentration relative to price - higher OI/price ratio indicates
+    more leverage and stronger liquidation potential. Allows smaller coins to achieve
+    high strength if they have concentrated OI (high leverage).
+    
+    Args:
+        oi_usd: Total OI in USD for this coin
+        mark_px: Mark price of the coin
+    
+    Returns:
+        Relative strength (0-1), where 1.0 = very high leverage/concentration
+    """
+    if not oi_usd or oi_usd <= 0:
+        return 0.0
+    
+    import math
+    
+    # Use absolute OI size as the primary indicator
+    # Higher OI = more liquidity = stronger signal potential
+    # Normalize using log scale to compress the range
+    
+    # Typical OI ranges (USD):
+    # - Very low: < $50k
+    # - Low: $50k - $1M
+    # - Medium: $1M - $10M
+    # - High: $10M - $100M
+    # - Very high: > $100M
+    #
+    # Use a smooth curve (no hard cutoff) so smaller tokens
+    # can still score when their setups are strong.
+    low_oi = 50_000
+    high_oi = 10_000_000
+    log_low = math.log10(low_oi)
+    log_high = math.log10(high_oi)
+    log_oi = math.log10(max(oi_usd, low_oi))
+    
+    # Normalize: log10(50k) -> 0.0, log10(10M) -> 1.0
+    normalized = (log_oi - log_low) / (log_high - log_low)
+    normalized = min(1.0, max(0.0, normalized))
+    
+    # Apply square root to compress high values (makes it more selective)
+    # This ensures coins with substantial OI get high scores
+    normalized = math.sqrt(normalized)
+    
+    return normalized
+
+
+def _hybrid_strength(base_strength: float, relative_strength: float, 
+                     base_weight: float = 0.2, relative_weight: float = 0.8) -> float:
+    """
+    Hybrid strength combining market share (base) and coin-specific (relative) metrics.
+    
+    This allows:
+    - Major coins to still be favored (liquidity advantage)
+    - Smaller coins to qualify if they have good setups (high leverage/concentration)
+    
+    Args:
+        base_strength: Market share strength (0-1)
+        relative_strength: Coin-specific strength (0-1)
+        base_weight: Weight for base strength (default 0.2 = 20%)
+        relative_weight: Weight for relative strength (default 0.8 = 80%)
+    
+    Returns:
+        Final strength (0-1)
+    """
+    return min(1.0, (base_strength * base_weight) + (relative_strength * relative_weight))
 
 
 def _enhanced_confidence_score(
@@ -171,11 +291,8 @@ def _enhanced_confidence_score(
             funding = float(funding_rate)
             abs_funding = abs(funding)
             
-            # Extreme funding threshold (0.000035 = 0.0035% per 8h, or ~0.0105% daily)
-            # Optimized based on historical analysis of 1680 funding samples (7 days, 10 symbols)
-            # 35 bps provides optimal balance: 11.9% trigger rate (optimal 5-15% range)
-            # Captures meaningful imbalances without noise, highest value score (27.31)
-            extreme_threshold = 0.000035
+            # Extreme funding threshold (shared constant for consistency)
+            extreme_threshold = FUNDING_EXTREME_THRESHOLD
             
             if abs_funding >= extreme_threshold:
                 # Check alignment
@@ -209,7 +326,7 @@ def _strength_from_oi_usd_fallback(oi_usd: float) -> float:
     return 0.3 + 0.7 * sqrt(ratio)
 
 
-def _funding_to_long_short_ratio(funding_rate: float, multiplier: float = 1000.0) -> float:
+def _funding_to_long_short_ratio(funding_rate: float, multiplier: float = FUNDING_RATIO_MULTIPLIER) -> float:
     """
     Convert Hyperliquid funding rate to long/short ratio.
     
@@ -389,6 +506,9 @@ def fetch_hyperliquid_batch_data() -> Dict[str, Any]:
             oi_sz = 0.0
         impact_pxs = ctx.get("impactPxs")  # [low, high] or null
         funding_rate = ctx.get("funding")  # Funding rate (positive = longs pay shorts)
+        funding_rate_smooth = _smooth_funding_rate(symbol, funding_rate)
+        trend_source = funding_rate_smooth if funding_rate_smooth is not None else funding_rate
+        funding_trend, funding_trend_delta, funding_trend_strength = _update_funding_trend(symbol, trend_source)
 
         oi_usd = oi_sz * mark_px
         symbol_ctx[symbol] = {
@@ -396,6 +516,10 @@ def fetch_hyperliquid_batch_data() -> Dict[str, Any]:
             "oi_usd": oi_usd,
             "impact_pxs": impact_pxs,
             "funding_rate": funding_rate,
+            "funding_rate_smooth": funding_rate_smooth,
+            "funding_trend": funding_trend,
+            "funding_trend_delta": funding_trend_delta,
+            "funding_trend_strength": funding_trend_strength,
         }
         total_oi_usd_all += max(oi_usd, 0.0)
 
@@ -404,13 +528,28 @@ def fetch_hyperliquid_batch_data() -> Dict[str, Any]:
         oi_usd = ctx["oi_usd"]
         impact_pxs = ctx["impact_pxs"]
         funding_rate = ctx.get("funding_rate")
+        funding_rate_smooth = ctx.get("funding_rate_smooth")
+        funding_trend = ctx.get("funding_trend", "FLAT")
+        funding_trend_delta = ctx.get("funding_trend_delta", 0.0)
+        funding_trend_strength = ctx.get("funding_trend_strength", 0.0)
         
-        strength = _strength_from_oi_share(oi_usd, total_oi_usd_all)
-        if strength <= 0:
-            strength = _strength_from_oi_usd_fallback(oi_usd)
+        # Calculate hybrid strength: combines market share + coin-specific metrics
+        base_strength = _strength_from_oi_share(oi_usd, total_oi_usd_all)
+        if base_strength <= 0:
+            base_strength = _strength_from_oi_usd_fallback(oi_usd)
+        
+        # Calculate relative strength (coin-specific, allows smaller coins to qualify)
+        # Uses absolute OI size, not price-dependent ratio
+        relative_strength = _relative_strength_from_oi_concentration(oi_usd)
+        
+        # Combine: 20% base (market share) + 80% relative (coin-specific)
+        # This allows smaller coins with good setups to achieve high strength
+        strength = _hybrid_strength(base_strength, relative_strength, 
+                                   base_weight=0.2, relative_weight=0.8)
         
         # Calculate long/short ratio from funding rate
-        long_short_ratio = _funding_to_long_short_ratio(funding_rate, multiplier=1000.0)
+        ratio_source = funding_rate_smooth if funding_rate_smooth is not None else funding_rate
+        long_short_ratio = _funding_to_long_short_ratio(ratio_source, multiplier=FUNDING_RATIO_MULTIPLIER)
         
         # Calculate long and short OI from ratio
         # If ratio = long_oi / short_oi, and total_oi = long_oi + short_oi:
@@ -431,12 +570,16 @@ def fetch_hyperliquid_batch_data() -> Dict[str, Any]:
             "long_oi_usd": long_oi_usd,
             "short_oi_usd": short_oi_usd,
             "long_short_ratio": long_short_ratio,
+            "funding_rate": funding_rate,
+            "funding_rate_smooth": funding_rate_smooth,
+            "funding_trend": funding_trend,
+            "funding_trend_delta": funding_trend_delta,
+            "funding_trend_strength": funding_trend_strength,
         }
         result["liquidation_levels"][symbol] = build_levels_from_hl(
             symbol, mark_px, oi_usd, impact_pxs, strength, now, funding_rate
         )
         
-        # Store funding_rate in open_interest_data for signal building
-        result["open_interest_data"][symbol]["funding_rate"] = funding_rate
+        # Funding rates already stored in open_interest_data for signal building
 
     return result

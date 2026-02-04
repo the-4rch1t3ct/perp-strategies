@@ -26,9 +26,6 @@ Trading strategy and API around **predictive liquidation clusters** (Wagmi). Age
 - **Batch (Hyperliquid, same shape):**  
   `GET https://api.wagmi-global.eu/api/trade/batch/hyperliquid?min_strength=0.6&max_distance=3.0`  
   Same response shape as `/api/trade/batch` but data is pulled from Hyperliquid (metaAndAssetCtxs: mark price, OI, impact prices). Same 10 symbols; sentiment uses total OI (no L/S split on HL public API).
-- **Batch (Aster, same shape):**  
-  `GET https://api.wagmi-global.eu/api/trade/batch/aster?min_strength=0.6&max_distance=3.0`  
-  Prices from Aster DEX (fapi.asterdex.com) so entry/TP/SL match venue. **Clusters:** Binance (primary) or Hyperliquid only (no synthetic). Symbols without real cluster data are omitted. Symbols: ETH, SOL, BNB, XRP, DOGE, BCH, LINK, XMR, ASTER, HYPE, SUI, PUMP (XAG, XAU removed). Per-symbol `cluster_source`: `"binance"` | `"hyperliquid"`.
 
 ---
 
@@ -120,7 +117,6 @@ Trading strategy and API around **predictive liquidation clusters** (Wagmi). Age
 | Start script | `api/start_liquidation_heatmap.sh` |
 | Deployment notes | `api/LIQUIDATION_HEATMAP_DEPLOYMENT.md` |
 | Hyperliquid batch data | `api/hyperliquid_batch.py` |
-| Aster batch data | `api/aster_batch.py` |
 | Signal metrics reference | `api/WAGMI_SIGNAL_METRICS.md` |
 
 ---
