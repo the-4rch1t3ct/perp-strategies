@@ -13,16 +13,33 @@ HL_INFO_URL = os.getenv("HL_BASE_URL", "https://api.hyperliquid.xyz").strip().rs
 HL_ACCOUNT_ADDRESS = os.getenv("HL_ACCOUNT_ADDRESS")
 HL_DEX = os.getenv("HL_DEX", "")
 
+# Timeouts and retries for resilience (HL can return 429 under load)
+HL_REQUEST_TIMEOUT = 10
+HL_RATE_LIMIT_CODES = (429, 500, 502, 503)
+
+
+def _hl_post(payload: Dict[str, Any], timeout: int = HL_REQUEST_TIMEOUT) -> Optional[Any]:
+    """POST to HL info endpoint. Returns parsed JSON or None on error/429/5xx/timeout. Never raises."""
+    try:
+        r = requests.post(HL_INFO_URL, json=payload, timeout=timeout)
+        if r.status_code in HL_RATE_LIMIT_CODES:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
 
 def _hl_get_mark_prices() -> Dict[str, float]:
     """Fetch current mark prices from Hyperliquid metaAndAssetCtxs.
     Response is a list: [meta, asset_ctxs] where meta has universe and asset_ctxs has markPx.
+    Returns {} on 429/5xx/timeout so dashboard keeps working with cached data.
     """
     marks = {}
     try:
-        r = requests.post(HL_INFO_URL, json={"type": "metaAndAssetCtxs"}, timeout=5)
-        r.raise_for_status()
-        data = r.json()
+        data = _hl_post({"type": "metaAndAssetCtxs"}, timeout=5)
+        if data is None:
+            return marks
         if isinstance(data, list) and len(data) >= 2:
             # Response structure: [meta, asset_ctxs]
             meta = data[0] if isinstance(data[0], dict) else {}
@@ -174,20 +191,16 @@ def _hl_equity_from_state(state: Dict[str, Any]) -> Optional[float]:
 def _hl_user_fills() -> List[Dict[str, Any]]:
     """Fetch user fills from Hyperliquid (up to 2000 most recent). No auth.
     aggregateByTime: true so partial fills for the same order are combined; closedPnl then
-    matches the exchange UI (one logical trade = one row with total PnL)."""
+    matches the exchange UI (one logical trade = one row with total PnL).
+    Returns [] on 429/5xx/timeout."""
     if not HL_ACCOUNT_ADDRESS or not HL_ACCOUNT_ADDRESS.strip():
         return []
     user = HL_ACCOUNT_ADDRESS.strip().lower()
     payload = {"type": "userFills", "user": user, "aggregateByTime": True}
     if HL_DEX:
         payload["dex"] = HL_DEX
-    try:
-        r = requests.post(HL_INFO_URL, json=payload, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    data = _hl_post(payload, timeout=HL_REQUEST_TIMEOUT)
+    return data if isinstance(data, list) else []
 
 
 def _hl_is_close_fill(f: Dict[str, Any]) -> bool:
@@ -391,26 +404,19 @@ def fetch_live_hyperliquid() -> Optional[Dict[str, Any]]:
     
     # Fetch spot balance first (matches UI "Total Balance")
     equity = None
-    try:
-        spot_payload = {"type": "spotClearinghouseState", "user": user}
-        if HL_DEX:
-            spot_payload["dex"] = HL_DEX
-        spot_r = requests.post(HL_INFO_URL, json=spot_payload, timeout=10)
-        spot_r.raise_for_status()
-        spot_state = spot_r.json()
-        if isinstance(spot_state, dict):
-            equity = _hl_equity_from_spot_state(spot_state)
-    except Exception:
-        pass  # Fall back to perpetuals accountValue
-    
+    spot_payload = {"type": "spotClearinghouseState", "user": user}
+    if HL_DEX:
+        spot_payload["dex"] = HL_DEX
+    spot_state = _hl_post(spot_payload, timeout=HL_REQUEST_TIMEOUT)
+    if isinstance(spot_state, dict):
+        equity = _hl_equity_from_spot_state(spot_state)
+
     # Fetch perpetuals state for positions
     payload = {"type": "clearinghouseState", "user": user}
     if HL_DEX:
         payload["dex"] = HL_DEX
+    state = _hl_post(payload, timeout=HL_REQUEST_TIMEOUT)
     try:
-        r = requests.post(HL_INFO_URL, json=payload, timeout=10)
-        r.raise_for_status()
-        state = r.json()
         if not isinstance(state, dict):
             return None
         # Use spot equity if available, otherwise fall back to perpetuals accountValue

@@ -52,7 +52,10 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup_load_oi_history():
     """Load persisted OI history so oi_1h is available after restarts."""
-    _load_oi_history_from_disk()
+    try:
+        _load_oi_history_from_disk()
+    except Exception as e:
+        print(f"⚠️  OI history load failed (non-fatal): {e}", flush=True)
 
 
 # Allowed symbols
@@ -320,6 +323,86 @@ def _parse_trade_time(t: dict) -> Optional[datetime]:
         return None
 
 
+def _trading_pnl_since(trades: List[Dict[str, Any]], since_dt: datetime) -> float:
+    """Sum of closed PnL (pnl_usd) for trades closed at or after since_dt. Excludes deposits/withdrawals."""
+    # Normalize to naive UTC so we can compare with _parse_trade_time (always returns naive)
+    if since_dt.tzinfo is not None:
+        since_dt = since_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    total = 0.0
+    for t in trades or []:
+        if not isinstance(t, dict):
+            continue
+        close_dt = _parse_trade_time(t)
+        if close_dt is None or close_dt < since_dt:
+            continue
+        try:
+            total += float(t.get("pnl_usd", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return round(total, 2)
+
+
+def _load_daily_equity_by_day() -> Dict[str, float]:
+    """Load persisted daily equity snapshots as day_iso -> equity (for PnL %)."""
+    out: Dict[str, float] = {}
+    if not DASHBOARD_DAILY_EQUITY_PATH.exists():
+        return out
+    try:
+        data = json.loads(DASHBOARD_DAILY_EQUITY_PATH.read_text())
+        snapshots = (data.get("snapshots") or []) if isinstance(data, dict) else []
+    except Exception:
+        return out
+    for s in snapshots:
+        if not isinstance(s, dict) or not s.get("day"):
+            continue
+        try:
+            eq = float(s.get("equity", 0))
+            if eq > 0:
+                out[str(s["day"]).strip()] = eq
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _trading_pnl_by_day(
+    trades: List[Dict[str, Any]],
+    equity_by_day: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    """Daily closed PnL from trade history (UTC day). Only includes closed days (excludes today until after midnight UTC). Returns list of {day, pnl_usd, pnl_pct}. Deposit-neutral."""
+    today_utc = datetime.now(timezone.utc).date()
+    today_iso = today_utc.isoformat()
+    by_day: Dict[str, float] = {}
+    for t in trades or []:
+        if not isinstance(t, dict):
+            continue
+        close_dt = _parse_trade_time(t)
+        if close_dt is None:
+            continue
+        day_str = close_dt.date().isoformat()
+        if day_str == today_iso:
+            continue
+        try:
+            pnl = float(t.get("pnl_usd", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        by_day[day_str] = by_day.get(day_str, 0.0) + pnl
+    equity_by_day = equity_by_day or {}
+    out = []
+    for day_str in sorted(by_day.keys()):
+        pnl_usd = round(by_day[day_str], 2)
+        pnl_pct = None
+        try:
+            day_dt = datetime.fromisoformat(day_str).date()
+            prev_day = (day_dt - timedelta(days=1)).isoformat()
+            prev_equity = equity_by_day.get(prev_day)
+            if prev_equity is not None and float(prev_equity) > 0:
+                pnl_pct = round((pnl_usd / float(prev_equity)) * 100, 2)
+        except (ValueError, TypeError):
+            pass
+        out.append({"day": day_str, "pnl_usd": pnl_usd, "pnl_pct": pnl_pct})
+    return out
+
+
 def _dashboard_snapshots_update_and_get_24h(
     current_equity: Optional[float],
     win_rate_pct: Optional[float],
@@ -490,8 +573,11 @@ def _dashboard_daily_equity_update_and_get(current_equity: Optional[float]) -> L
     return daily
 
 
-def _dashboard_apr_apy(current_equity: Optional[float]) -> Dict[str, Optional[float]]:
-    """Compute 1d/7d/30d APR and 30d APY from daily equity snapshots. Returns pct values (e.g. 12.5 for 12.5%)."""
+def _dashboard_apr_apy(
+    current_equity: Optional[float],
+    all_trades: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Optional[float]]:
+    """Compute 1d/7d/30d APR and 30d APY from past equity + trading PnL (deposit-neutral). Returns pct values."""
     out = {"apr_1d_pct": None, "apr_7d_pct": None, "apr_30d_pct": None, "apy_30d_pct": None}
     try:
         eq_now = float(current_equity) if current_equity is not None else None
@@ -530,13 +616,26 @@ def _dashboard_apr_apy(current_equity: Optional[float]) -> Dict[str, Optional[fl
     eq_1d = equity_on_or_before(today_utc - timedelta(days=1))
     eq_7d = equity_on_or_before(today_utc - timedelta(days=7))
     eq_30d = equity_on_or_before(today_utc - timedelta(days=30))
+
+    # Use trading PnL over each period so deposits/withdrawals don't inflate APR/APY
+    now_utc = datetime.now(timezone.utc)
+    pnl_1d = _trading_pnl_since(all_trades or [], now_utc - timedelta(days=1))
+    pnl_7d = _trading_pnl_since(all_trades or [], now_utc - timedelta(days=7))
+    pnl_30d = _trading_pnl_since(all_trades or [], now_utc - timedelta(days=30))
+
     if eq_1d and eq_1d > 0:
-        out["apr_1d_pct"] = round((eq_now / eq_1d - 1) * 365 * 100, 2)
+        eq_effective_1d = eq_1d + pnl_1d
+        if eq_effective_1d > 0:
+            out["apr_1d_pct"] = round((eq_effective_1d / eq_1d - 1) * 365 * 100, 2)
     if eq_7d and eq_7d > 0:
-        out["apr_7d_pct"] = round((eq_now / eq_7d - 1) * (365 / 7) * 100, 2)
+        eq_effective_7d = eq_7d + pnl_7d
+        if eq_effective_7d > 0:
+            out["apr_7d_pct"] = round((eq_effective_7d / eq_7d - 1) * (365 / 7) * 100, 2)
     if eq_30d and eq_30d > 0:
-        out["apr_30d_pct"] = round((eq_now / eq_30d - 1) * (365 / 30) * 100, 2)
-        out["apy_30d_pct"] = round((pow(eq_now / eq_30d, 365 / 30) - 1) * 100, 2)
+        eq_effective_30d = eq_30d + pnl_30d
+        if eq_effective_30d > 0:
+            out["apr_30d_pct"] = round((eq_effective_30d / eq_30d - 1) * (365 / 30) * 100, 2)
+            out["apy_30d_pct"] = round((pow(eq_effective_30d / eq_30d, 365 / 30) - 1) * 100, 2)
     return out
 
 
@@ -704,8 +803,8 @@ def _compute_summary(perf: Dict[str, Any], positions: Dict[str, Any]) -> Dict[st
         won = sum((s or {}).get("won", 0) for s in signals.values())
         lost = sum((s or {}).get("lost", 0) for s in signals.values())
     win_rate = round((won / total) * 100, 2) if total > 0 else 0.0
-    last_10_pnl = round(sum(t.get("pnl_usd", 0) for t in last_10 if isinstance(t, dict)), 2)
-    last_trade_time = last_trades[-1].get("time") if last_trades else None
+    last_10_pnl = round(sum(float(t.get("pnl_usd", 0) or 0) for t in last_10 if isinstance(t, dict)), 2)
+    last_trade_time = (last_trades[-1].get("time") if isinstance(last_trades[-1], dict) else None) if last_trades else None
     meta = perf.get("meta", {}) if isinstance(perf, dict) else {}
     equity = meta.get("last_equity")
     equity_time = meta.get("last_equity_time")
@@ -1045,9 +1144,15 @@ async def get_portfolio_dashboard():
         hl_summary = _compute_summary(hl_perf, hl_pos)
         if fetch_live_hyperliquid:
             try:
-                live_hl = await asyncio.to_thread(fetch_live_hyperliquid)
+                # Timeout so a hung HL API cannot block the server (dashboard polls every 15s)
+                live_hl = await asyncio.wait_for(
+                    asyncio.to_thread(fetch_live_hyperliquid),
+                    timeout=25.0,
+                )
                 if live_hl:
                     hl_summary = _merge_live_into_summary(hl_summary, live_hl)
+            except asyncio.TimeoutError:
+                print("⚠️  Live Hyperliquid fetch timed out (25s), using cached data", flush=True)
             except Exception as e:
                 # Log error but don't fail - use cached data
                 import traceback
@@ -1060,12 +1165,30 @@ async def get_portfolio_dashboard():
             hl_summary.get("sharpe_ratio"),
             hl_summary.get("profit_factor"),
         )
-        hl_summary["equity_24h_ago"] = values_24h.get("equity_24h_ago")
+        # 24h equity change: use trading-only PnL so deposits/withdrawals don't inflate the diff
+        all_trades = hl_summary.get("all_trades") or []
+        now_utc = datetime.now(timezone.utc)
+        trading_pnl_24h = _trading_pnl_since(all_trades, now_utc - timedelta(hours=24))
+        eq_now = hl_summary.get("equity")
+        try:
+            eq_now_f = float(eq_now) if eq_now is not None else None
+        except (TypeError, ValueError):
+            eq_now_f = None
+        if eq_now_f is not None:
+            hl_summary["equity_24h_ago"] = round(eq_now_f - trading_pnl_24h, 2)
+        else:
+            hl_summary["equity_24h_ago"] = values_24h.get("equity_24h_ago")
         hl_summary["win_rate_pct_24h_ago"] = values_24h.get("win_rate_pct_24h_ago")
         hl_summary["sharpe_ratio_24h_ago"] = values_24h.get("sharpe_ratio_24h_ago")
         hl_summary["profit_factor_24h_ago"] = values_24h.get("profit_factor_24h_ago")
-        hl_summary["daily_pnl"] = _dashboard_daily_equity_update_and_get(hl_summary.get("equity"))
-        apr_apy = _dashboard_apr_apy(hl_summary.get("equity"))
+        # Persist daily equity snapshot (for APR baseline); daily PnL from trades when available (deposit-neutral)
+        daily_from_equity = _dashboard_daily_equity_update_and_get(hl_summary.get("equity"))
+        if all_trades:
+            equity_by_day = _load_daily_equity_by_day()
+            hl_summary["daily_pnl"] = _trading_pnl_by_day(all_trades, equity_by_day=equity_by_day)
+        else:
+            hl_summary["daily_pnl"] = daily_from_equity
+        apr_apy = _dashboard_apr_apy(hl_summary.get("equity"), all_trades=all_trades)
         hl_summary["apr_1d_pct"] = apr_apy.get("apr_1d_pct")
         hl_summary["apr_7d_pct"] = apr_apy.get("apr_7d_pct")
         hl_summary["apr_30d_pct"] = apr_apy.get("apr_30d_pct")
@@ -1280,6 +1403,14 @@ async def portfolio_dashboard():
           </thead>
           <tbody id="hl-positions"></tbody>
         </table>
+      </div>
+      <div class="section-title">Deposit / Withdrawal</div>
+      <div class="panel" style="margin-top:10px;">
+        <p class="muted" style="margin:0 0 12px 0;">Move USDC to and from your Hyperliquid perpetuals account. PnL and APR on this dashboard are trading-only (deposits and withdrawals do not affect them).</p>
+        <div style="margin-top:8px; display:flex; gap:12px; flex-wrap:wrap;">
+          <a href="https://app.hyperliquid.xyz/withdraw" target="_blank" rel="noopener noreferrer" style="display:inline-flex; align-items:center; gap:8px; padding:12px 16px; text-decoration:none; color:var(--accent); border:1px solid rgba(255,255,255,0.14); border-radius:12px; font-weight:600; background:var(--panel);">Deposit →</a>
+          <a href="https://app.hyperliquid.xyz/withdraw" target="_blank" rel="noopener noreferrer" style="display:inline-flex; align-items:center; gap:8px; padding:12px 16px; text-decoration:none; color:var(--accent); border:1px solid rgba(255,255,255,0.14); border-radius:12px; font-weight:600; background:var(--panel);">Withdraw →</a>
+        </div>
       </div>
     </div>
   </div>

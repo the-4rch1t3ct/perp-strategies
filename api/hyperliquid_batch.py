@@ -89,6 +89,17 @@ SYMBOL_TO_COIN: Dict[str, str] = {
     "BONKUSDT": "BONK",
     "FLOKIUSDT": "FLOKI",
     "SHIBUSDT": "SHIB",
+    # Batch 3 - 10 more for hyperliquid batch
+    "IMXUSDT": "IMX",
+    "RENDERUSDT": "RENDER",
+    "PENDLEUSDT": "PENDLE",
+    "NOTUSDT": "NOT",
+    "JUPUSDT": "JUP",
+    "STXUSDT": "STX",
+    "BLURUSDT": "BLUR",
+    "WLDUSDT": "WLD",
+    "EIGENUSDT": "EIGEN",
+    "MANTAUSDT": "MANTA",
 }
 SUPPORTED_SYMBOLS_HL = list(SYMBOL_TO_COIN.keys())
 

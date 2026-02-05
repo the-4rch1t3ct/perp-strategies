@@ -140,6 +140,17 @@ SUPPORTED_SYMBOLS = [
     'BONKUSDT',  # Bonk
     'FLOKIUSDT', # Floki
     'SHIBUSDT',  # Shiba Inu
+    # Batch 3 - 10 more symbols for hyperliquid batch
+    'IMXUSDT',   # Immutable X
+    'RENDERUSDT',# Render
+    'PENDLEUSDT',# Pendle
+    'NOTUSDT',   # Notcoin
+    'JUPUSDT',   # Jupiter
+    'STXUSDT',   # Stacks
+    'BLURUSDT',  # Blur
+    'WLDUSDT',   # Worldcoin
+    'EIGENUSDT', # EigenLayer
+    'MANTAUSDT', # Manta
 ]
 
 # Response models (updated for predictive levels)
