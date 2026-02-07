@@ -58,48 +58,25 @@ SYMBOL_TO_COIN: Dict[str, str] = {
     "APTUSDT": "APT",
     "INJUSDT": "INJ",
     "TIAUSDT": "TIA",
-    # Tier 5 - High-Volume Meme Coins
+    # Tier 5 - High-Volume Memes (BONK/FLOKI/SHIB removed for API speed)
     "PEPEUSDT": "PEPE",
     "WIFUSDT": "WIF",
-    # Batch 2 - Additional High-Quality Assets
-    # Tier 1 - Major Coins
+    # Batch 2 - DeFi/L2 (COMP, SNX, SUPER, TNSR, Batch 3 removed for speed)
     "ETCUSDT": "ETC",
     "ALGOUSDT": "ALGO",
     "NEARUSDT": "NEAR",
     "ICPUSDT": "ICP",
-    "FILUSDT": "FIL",   # Filecoin (replaces FTM - not available for perp)
-    "JTOUSDT": "JTO",   # Jupiter (replaces MYRO - not available for perp)
-    "RUNEUSDT": "RUNE", # THORChain (replaces MKR - not available for perp)
-    # Tier 2 - DeFi Tokens
+    "FILUSDT": "FIL",
+    "JTOUSDT": "JTO",
+    "RUNEUSDT": "RUNE",
     "AAVEUSDT": "AAVE",
-    "COMPUSDT": "COMP",
     "CRVUSDT": "CRV",
-    "SNXUSDT": "SNX",
     "GMXUSDT": "GMX",
     "DYDXUSDT": "DYDX",
-    # Tier 3 - Layer 2s & Scaling
     "STRKUSDT": "STRK",
     "ZROUSDT": "ZRO",
     "METISUSDT": "METIS",
-    # Tier 4 - Emerging L1s
     "SEIUSDT": "SEI",
-    "SUPERUSDT": "SUPER",
-    "TNSRUSDT": "TNSR",
-    # Tier 5 - High-Volume Memes
-    "BONKUSDT": "BONK",
-    "FLOKIUSDT": "FLOKI",
-    "SHIBUSDT": "SHIB",
-    # Batch 3 - 10 more for hyperliquid batch
-    "IMXUSDT": "IMX",
-    "RENDERUSDT": "RENDER",
-    "PENDLEUSDT": "PENDLE",
-    "NOTUSDT": "NOT",
-    "JUPUSDT": "JUP",
-    "STXUSDT": "STX",
-    "BLURUSDT": "BLUR",
-    "WLDUSDT": "WLD",
-    "EIGENUSDT": "EIGEN",
-    "MANTAUSDT": "MANTA",
 }
 SUPPORTED_SYMBOLS_HL = list(SYMBOL_TO_COIN.keys())
 

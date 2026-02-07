@@ -24,6 +24,8 @@ import logging
 import threading
 import time
 import requests
+import json
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
@@ -33,8 +35,10 @@ from fastapi import Body
 from predictive_liquidation_heatmap import PredictiveLiquidationHeatmap, LiquidationLevel
 # Hyperliquid batch (same response shape, HL data source)
 try:
+    import hyperliquid_batch as hl_batch
     from hyperliquid_batch import fetch_hyperliquid_batch_data, SUPPORTED_SYMBOLS_HL, SYMBOL_TO_COIN, _enhanced_confidence_score
 except ImportError:
+    hl_batch = None
     fetch_hyperliquid_batch_data = None
     SUPPORTED_SYMBOLS_HL = []
     SYMBOL_TO_COIN = {}
@@ -55,6 +59,8 @@ app.add_middleware(
 heatmap: Optional[PredictiveLiquidationHeatmap] = None
 heatmap_lock = threading.Lock()
 TREND_CACHE = {}
+CLAWD_MEMORY_DIR = Path("/home/botadmin/clawd/memory")
+BATCH_SETTINGS_SNAPSHOT_PATH = CLAWD_MEMORY_DIR / "batch_api_settings.json"
 
 # Batching system for performance optimization
 BATCH_SIZE = 10  # Process assets in batches of 10
@@ -69,6 +75,20 @@ HYPERLIQUID_DATA_CACHE_TIME = 0
 HYPERLIQUID_DATA_CACHE_TTL = 1.5  # Cache Hyperliquid data for 1.5 seconds (shared across all requests)
 # Reduced to 5s for fresher signals while maintaining cache benefits
 BATCH_CACHE_TTL = 5  # Balance between freshness (5s) and performance
+
+# Precomputed full batch for /api/trade/batch/hyperliquid (default params only); avoids on-request work and 504s
+HL_BATCH_FULL_CACHE: Optional[Dict] = None  # {"results": {...}, "data_ts": float}
+HL_BATCH_FULL_CACHE_LOCK = threading.Lock()
+HL_BATCH_DEFAULT_STRENGTH = 0.70
+HL_BATCH_DEFAULT_DISTANCE = 3.0
+
+# Predictive heatmap configuration
+HEATMAP_LEVERAGE_TIERS = [100, 50, 25, 10, 5]
+HEATMAP_PRICE_BUCKET_PCT = 0.005
+HEATMAP_MIN_OI_THRESHOLD = 25000
+HEATMAP_MIN_OI_THRESHOLD_PCT = 0.02
+HEATMAP_MIN_CLUSTER_DISTANCE_PCT = 0.3
+HEATMAP_UPDATE_INTERVAL_SEC = 3.0
 
 # Rate limiting protection
 # Hyperliquid: 1200 weight/minute per IP
@@ -109,48 +129,25 @@ SUPPORTED_SYMBOLS = [
     'APTUSDT',   # Aptos
     'INJUSDT',   # Injective
     'TIAUSDT',   # Celestia
-    # Tier 5 - High-Volume Meme Coins
+    # Tier 5 - High-Volume Meme (keep PEPE, WIF only; BONK/FLOKI/SHIB removed for speed)
     'PEPEUSDT',  # Pepe
     'WIFUSDT',   # dogwifhat
-    # Batch 2 - Additional High-Quality Assets (21 more to reach 50)
-    # Tier 1 - Major Coins
+    # Batch 2 - Additional High-Quality Assets (removed COMP, SNX, SUPER, TNSR for speed)
     'ETCUSDT',   # Ethereum Classic
     'ALGOUSDT',  # Algorand
     'NEARUSDT',  # NEAR Protocol
     'ICPUSDT',   # Internet Computer
-    'FILUSDT',   # Filecoin (replaces FTM - not available for perp)
-    'JTOUSDT',   # Jupiter (replaces MYRO - not available for perp)
-    'RUNEUSDT',  # THORChain (replaces MKR - not available for perp)
-    # Tier 2 - DeFi Tokens
+    'FILUSDT',   # Filecoin
+    'JTOUSDT',   # Jupiter
+    'RUNEUSDT',  # THORChain
     'AAVEUSDT',  # Aave
-    'COMPUSDT',  # Compound
     'CRVUSDT',   # Curve
-    'SNXUSDT',   # Synthetix
     'GMXUSDT',   # GMX
     'DYDXUSDT',  # dYdX
-    # Tier 3 - Layer 2s & Scaling
     'STRKUSDT',  # Starknet
     'ZROUSDT',   # LayerZero
     'METISUSDT', # Metis
-    # Tier 4 - Emerging L1s
     'SEIUSDT',   # Sei
-    'SUPERUSDT', # Superchain
-    'TNSRUSDT',  # Tensor
-    # Tier 5 - High-Volume Memes
-    'BONKUSDT',  # Bonk
-    'FLOKIUSDT', # Floki
-    'SHIBUSDT',  # Shiba Inu
-    # Batch 3 - 10 more symbols for hyperliquid batch
-    'IMXUSDT',   # Immutable X
-    'RENDERUSDT',# Render
-    'PENDLEUSDT',# Pendle
-    'NOTUSDT',   # Notcoin
-    'JUPUSDT',   # Jupiter
-    'STXUSDT',   # Stacks
-    'BLURUSDT',  # Blur
-    'WLDUSDT',   # Worldcoin
-    'EIGENUSDT', # EigenLayer
-    'MANTAUSDT', # Manta
 ]
 
 # Response models (updated for predictive levels)
@@ -185,12 +182,12 @@ def initialize_heatmap():
     with heatmap_lock:
         if heatmap is None:
             heatmap = PredictiveLiquidationHeatmap(
-                leverage_tiers=[100, 50, 25, 10, 5],  # Common leverage levels
-                price_bucket_pct=0.005,  # 0.5% price buckets (reduced noise)
-                min_oi_threshold=25000,  # Absolute OI floor (USD)
-                min_oi_threshold_pct=0.02,  # Relative OI floor (% of total OI)
-                min_cluster_distance_pct=0.3,  # Minimum 0.3% distance between clusters
-                update_interval=3.0  # Recalc levels every 3s (uses cached prices/OI)
+                leverage_tiers=HEATMAP_LEVERAGE_TIERS,  # Common leverage levels
+                price_bucket_pct=HEATMAP_PRICE_BUCKET_PCT,  # 0.5% price buckets (reduced noise)
+                min_oi_threshold=HEATMAP_MIN_OI_THRESHOLD,  # Absolute OI floor (USD)
+                min_oi_threshold_pct=HEATMAP_MIN_OI_THRESHOLD_PCT,  # Relative OI floor (% of total OI)
+                min_cluster_distance_pct=HEATMAP_MIN_CLUSTER_DISTANCE_PCT,  # Min distance between clusters
+                update_interval=HEATMAP_UPDATE_INTERVAL_SEC  # Recalc levels every 3s (uses cached prices/OI)
             )
             
             # Start predictive heatmap for all supported symbols
@@ -200,6 +197,67 @@ def initialize_heatmap():
             print(f"   Calculating liquidation levels BEFORE they occur")
             print(f"   Leverage tiers: {heatmap.leverage_tiers}")
 
+def _serialize_settings_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        return [_serialize_settings_value(v) for v in value]
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            out[str(k)] = _serialize_settings_value(v)
+        return out
+    if isinstance(value, datetime):
+        return value.isoformat()
+    cls_name = value.__class__.__name__
+    if cls_name in {"lock", "RLock", "Event", "Condition", "Semaphore"}:
+        return f"<{cls_name}>"
+    return str(value)
+
+def _collect_uppercase_settings(source_globals, exclude_keys=None):
+    settings = {}
+    exclude_keys = exclude_keys or set()
+    for name, value in source_globals.items():
+        if not name.isupper():
+            continue
+        if name.startswith("_"):
+            continue
+        if name in exclude_keys:
+            continue
+        settings[name] = _serialize_settings_value(value)
+    return settings
+
+def write_batch_settings_snapshot():
+    """Persist batch API settings for dashboard display."""
+    exclude = {
+        "TREND_CACHE",
+        "BATCH_CACHE",
+        "BATCH_LAST_UPDATE",
+        "HYPERLIQUID_DATA_CACHE",
+        "HYPERLIQUID_DATA_CACHE_TIME",
+        "HL_BATCH_FULL_CACHE",
+        "HL_BATCH_FULL_CACHE_LOCK",
+        "BATCH_UPDATE_LOCK",
+        "heatmap",
+    }
+    api_settings = _collect_uppercase_settings(globals(), exclude_keys=exclude)
+    hl_settings = _collect_uppercase_settings(hl_batch.__dict__, exclude_keys=exclude) if hl_batch else {}
+    payload = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "pid": os.getpid(),
+        "source": "liquidation_heatmap_api.py",
+        "settings": {
+            "liquidation_heatmap_api": api_settings,
+            "hyperliquid_batch": hl_settings,
+        },
+    }
+    try:
+        CLAWD_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        with open(BATCH_SETTINGS_SNAPSHOT_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"❌ Failed to write batch settings snapshot: {e}", flush=True)
+
 # Price updates are now handled internally by PredictiveLiquidationHeatmap
 # No need for separate background task
 
@@ -207,8 +265,11 @@ def initialize_heatmap():
 @app.on_event("startup")
 async def startup_event():
     initialize_heatmap()
+    write_batch_settings_snapshot()
     # Rolling trend refresh: keep TREND_CACHE warm in sync with batch updates (one batch every 5s).
     threading.Thread(target=_rolling_trend_refresh_worker, daemon=True).start()
+    if fetch_hyperliquid_batch_data is not None:
+        threading.Thread(target=_hl_batch_background_refresh_worker, daemon=True).start()
     # Parallel warmup: fill trend cache for first 2 batches so first request is fast (trend is mandatory).
     def _parallel_warm_trend():
         batches = [SUPPORTED_SYMBOLS[i:i + BATCH_SIZE] for i in range(0, len(SUPPORTED_SYMBOLS), BATCH_SIZE)]
@@ -1068,6 +1129,31 @@ _TREND_WARN_LAST: Dict[str, float] = {}
 _TREND_ROLLING_BATCH_INDEX = 0
 _TREND_ROLLING_LOCK = threading.Lock()
 
+def _hl_batch_background_refresh_worker():
+    """Background thread: every BATCH_CACHE_TTL compute full HL batch (default params) and store in HL_BATCH_FULL_CACHE."""
+    global HL_BATCH_FULL_CACHE
+    if fetch_hyperliquid_batch_data is None:
+        return
+    batches = [SUPPORTED_SYMBOLS[i:i + BATCH_SIZE] for i in range(0, len(SUPPORTED_SYMBOLS), BATCH_SIZE)]
+    try:
+        while True:
+            try:
+                data = fetch_hyperliquid_batch_data()
+                results = {}
+                for batch_symbols in batches:
+                    batch_results = _process_symbol_batch(
+                        batch_symbols, data, HL_BATCH_DEFAULT_STRENGTH, HL_BATCH_DEFAULT_DISTANCE, skip_trend=False
+                    )
+                    results.update(batch_results)
+                with HL_BATCH_FULL_CACHE_LOCK:
+                    HL_BATCH_FULL_CACHE = {"results": results, "data_ts": time.time()}
+            except Exception as e:
+                logger.warning("HL batch background refresh error: %s", e)
+            time.sleep(BATCH_CACHE_TTL)
+    except Exception as e:
+        logger.warning("HL batch background worker stopped: %s", e)
+
+
 def _rolling_trend_refresh_worker():
     """Background thread: refresh trend for one batch of symbols every TREND_ROLLING_INTERVAL_SEC, in sync with batch cache."""
     global _TREND_ROLLING_BATCH_INDEX
@@ -1480,41 +1566,30 @@ async def get_batch_trade_data_hyperliquid(
 ):
     """
     Same response shape as /api/trade/batch but data is pulled from Hyperliquid.
-    GET https://api.hyperliquid.xyz/info (metaAndAssetCtxs: mark price, OI, impact prices).
-    Returns all symbols that exist on Hyperliquid.
-    
-    Batching: Assets are processed in batches of 10 for performance. Use batch_id to get specific batch,
-    or omit to get all batches (may be slower for 50+ assets).
+    Full-batch (no batch_id) returns precomputed cache for default params for speed and freshness; data_age_ms indicates age.
     """
     if fetch_hyperliquid_batch_data is None:
         raise HTTPException(status_code=503, detail="Hyperliquid batch module not available")
     
-    # Cache Hyperliquid data fetch (shared across all batches/requests)
-    global HYPERLIQUID_DATA_CACHE, HYPERLIQUID_DATA_CACHE_TIME
+    global HL_BATCH_FULL_CACHE, HYPERLIQUID_DATA_CACHE, HYPERLIQUID_DATA_CACHE_TIME
     current_time = time.time()
-    cache_age = current_time - HYPERLIQUID_DATA_CACHE_TIME
-    data_age_ms = int(cache_age * 1000) if HYPERLIQUID_DATA_CACHE_TIME > 0 else 0
-    
-    if HYPERLIQUID_DATA_CACHE is None or cache_age >= HYPERLIQUID_DATA_CACHE_TTL:
-        # Fetch fresh data
-        data = fetch_hyperliquid_batch_data()
-        HYPERLIQUID_DATA_CACHE = data
-        HYPERLIQUID_DATA_CACHE_TIME = current_time
-        data_age_ms = 0  # Fresh data
-    else:
-        # Use cached data
-        data = HYPERLIQUID_DATA_CACHE
-    
-    # Split symbols into batches
     all_symbols = SUPPORTED_SYMBOLS
     batches = [all_symbols[i:i + BATCH_SIZE] for i in range(0, len(all_symbols), BATCH_SIZE)]
     
-    # If batch_id specified, return only that batch
+    # Single-batch request: use HL data cache and process that batch only
     if batch_id is not None:
+        cache_age = current_time - HYPERLIQUID_DATA_CACHE_TIME
+        data_age_ms = int(cache_age * 1000) if HYPERLIQUID_DATA_CACHE_TIME > 0 else 0
+        if HYPERLIQUID_DATA_CACHE is None or cache_age >= HYPERLIQUID_DATA_CACHE_TTL:
+            data = fetch_hyperliquid_batch_data()
+            HYPERLIQUID_DATA_CACHE = data
+            HYPERLIQUID_DATA_CACHE_TIME = current_time
+            data_age_ms = 0
+        else:
+            data = HYPERLIQUID_DATA_CACHE
         if batch_id < 0 or batch_id >= len(batches):
             raise HTTPException(status_code=400, detail=f"batch_id must be between 0 and {len(batches)-1}")
         batch_symbols = batches[batch_id]
-        # Skip trend for single batch requests (faster, trader can request trend separately if needed)
         results = _process_symbol_batch(batch_symbols, data, min_strength, max_distance, skip_trend=False)
         return BatchTradeResponse(
             results=results,
@@ -1522,31 +1597,43 @@ async def get_batch_trade_data_hyperliquid(
             data_age_ms=data_age_ms
         )
     
-    # Process all batches (for backward compatibility)
-    # Use cached results where possible, update in background
+    # Full-batch request: serve from precomputed cache when params are default (fast path, no 504)
+    use_default_cache = (min_strength == HL_BATCH_DEFAULT_STRENGTH and max_distance == HL_BATCH_DEFAULT_DISTANCE)
+    if use_default_cache:
+        with HL_BATCH_FULL_CACHE_LOCK:
+            cached = HL_BATCH_FULL_CACHE
+        if cached is not None:
+            data_ts = cached.get("data_ts", 0)
+            data_age_ms = int((current_time - data_ts) * 1000)
+            return BatchTradeResponse(
+                results=cached["results"],
+                ts=datetime.now().strftime("%H:%M:%S"),
+                data_age_ms=data_age_ms
+            )
+        # Cache not ready yet: compute once and prime cache (first request after startup)
+        data = fetch_hyperliquid_batch_data()
+        results = {}
+        for batch_symbols in batches:
+            results.update(_process_symbol_batch(
+                batch_symbols, data, min_strength, max_distance, skip_trend=False
+            ))
+        with HL_BATCH_FULL_CACHE_LOCK:
+            HL_BATCH_FULL_CACHE = {"results": results, "data_ts": current_time}
+        return BatchTradeResponse(
+            results=results,
+            ts=datetime.now().strftime("%H:%M:%S"),
+            data_age_ms=0
+        )
+    
+    # Non-default params: compute on request (no cache)
+    data = fetch_hyperliquid_batch_data()
     results = {}
-    
-    # Check cache and process batches
-    for batch_idx, batch_symbols in enumerate(batches):
-        cache_key = f"{batch_idx}_{min_strength}_{max_distance}"
-        cache_age = current_time - BATCH_LAST_UPDATE.get(cache_key, 0)
-        
-        # Use cache if fresh (< BATCH_CACHE_TTL seconds old)
-        if cache_key in BATCH_CACHE and cache_age < BATCH_CACHE_TTL:
-            results.update(BATCH_CACHE[cache_key])
-        else:
-            # Process batch and cache result
-            # Skip trend calculation for all-batch requests to speed up (trend can be calculated on-demand)
-            batch_results = _process_symbol_batch(batch_symbols, data, min_strength, max_distance, skip_trend=False)
-            results.update(batch_results)
-            with BATCH_UPDATE_LOCK:
-                BATCH_CACHE[cache_key] = batch_results
-                BATCH_LAST_UPDATE[cache_key] = current_time
-    
+    for batch_symbols in batches:
+        results.update(_process_symbol_batch(batch_symbols, data, min_strength, max_distance, skip_trend=False))
     return BatchTradeResponse(
         results=results,
         ts=datetime.now().strftime("%H:%M:%S"),
-        data_age_ms=data_age_ms
+        data_age_ms=0
     )
 
 @app.get("/api/trade/batch", response_model=BatchTradeResponse)
