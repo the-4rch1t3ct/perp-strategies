@@ -142,8 +142,6 @@ DASHBOARD_DAILY_EQUITY_PATH = CLAWD_MEMORY_DIR / "dashboard_daily_equity.json"
 DASHBOARD_DAILY_EQUITY_MAX = 370  # ~1 year of daily snapshots
 # After reset: only show trades that closed on or after this time (ISO ts). Set by reset_dashboard_data.sh.
 DASHBOARD_PERFORMANCE_SINCE_PATH = CLAWD_MEMORY_DIR / "dashboard_performance_since.json"
-TRADER_SETTINGS_PATH = CLAWD_MEMORY_DIR / "trader_settings.json"
-BATCH_SETTINGS_PATH = CLAWD_MEMORY_DIR / "batch_api_settings.json"
 
 # Optional live fetch for positions/equity (set env for HL to enable)
 try:
@@ -167,6 +165,33 @@ def _load_json(path: Path) -> Dict[str, Any]:
         return json.loads(path.read_text())
     except Exception:
         return {}
+
+
+TRADER_ACTIONS_LOG_PATH = Path("/home/botadmin/clawd/memory/trader_actions.jsonl")
+TRADER_ACTIONS_LIMIT = 80
+
+
+def _load_trader_actions(limit: int = TRADER_ACTIONS_LIMIT) -> List[Dict[str, Any]]:
+    """Read last N trader actions (same messages as Telegram) for the dashboard stream. Newest first."""
+    out = []
+    try:
+        if not TRADER_ACTIONS_LOG_PATH.exists():
+            return out
+        with open(TRADER_ACTIONS_LOG_PATH, "r") as f:
+            lines = f.readlines()
+        for line in reversed(lines[-limit:]):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and data.get("ts"):
+                    out.append({"ts": data.get("ts"), "msg": data.get("msg", "")})
+            except (json.JSONDecodeError, TypeError):
+                continue
+    except Exception:
+        pass
+    return out
 
 
 def _is_open_position(pos: Dict[str, Any]) -> bool:
@@ -420,7 +445,7 @@ def _trading_pnl_by_day(
     trades: List[Dict[str, Any]],
     equity_by_day: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
-    """Daily closed PnL from trade history (UTC day). Only includes closed days (excludes today until after midnight UTC). Returns list of {day, pnl_usd, pnl_pct}. Deposit-neutral."""
+    """Daily closed PnL from trade history (UTC day). Only includes closed days (excludes today). Returns list of {day, pnl_usd, pnl_pct}. pnl_pct = that day's PnL as % of portfolio equity at start of that day. We derive start-of-day equity by chaining backward from the most recent snapshot (so stale/low snapshots don't inflate %). Deposit-neutral."""
     today_utc = datetime.now(timezone.utc).date()
     today_iso = today_utc.isoformat()
     by_day: Dict[str, float] = {}
@@ -439,18 +464,38 @@ def _trading_pnl_by_day(
             continue
         by_day[day_str] = by_day.get(day_str, 0.0) + pnl
     equity_by_day = equity_by_day or {}
+    sorted_days = sorted(by_day.keys())
+    if not sorted_days:
+        return []
+    # Derive start-of-day equity by chaining backward from the latest day with a snapshot.
+    # So: for latest day L, end_L = snapshot[L], start_L = end_L - pnl_L; for L-1, end_{L-1} = start_L, start_{L-1} = end_{L-1} - pnl_{L-1}; etc.
+    start_by_day: Dict[str, float] = {}
+    days_desc = sorted_days[::-1]
+    end_next: Optional[float] = None
+    for day_str in days_desc:
+        pnl_usd = by_day[day_str]
+        # Chain backward: use previous day's start as this day's end. Only seed from snapshot on the latest day (so stale snapshots don't inflate %).
+        end_of_day = None
+        if end_next is not None:
+            end_of_day = end_next
+        elif equity_by_day.get(day_str) is not None and float(equity_by_day[day_str]) > 0:
+            end_of_day = float(equity_by_day[day_str])
+        if end_of_day is not None and end_of_day > pnl_usd:
+            start_of_day = end_of_day - pnl_usd
+            start_by_day[day_str] = start_of_day
+            end_next = start_of_day
+        else:
+            end_next = None
     out = []
-    for day_str in sorted(by_day.keys()):
+    for day_str in sorted_days:
         pnl_usd = round(by_day[day_str], 2)
         pnl_pct = None
-        try:
-            day_dt = datetime.fromisoformat(day_str).date()
-            prev_day = (day_dt - timedelta(days=1)).isoformat()
-            prev_equity = equity_by_day.get(prev_day)
-            if prev_equity is not None and float(prev_equity) > 0:
-                pnl_pct = round((pnl_usd / float(prev_equity)) * 100, 2)
-        except (ValueError, TypeError):
-            pass
+        start_equity = start_by_day.get(day_str)
+        if start_equity is not None and start_equity > 0:
+            try:
+                pnl_pct = round((pnl_usd / start_equity) * 100, 2)
+            except (ValueError, TypeError):
+                pass
         out.append({"day": day_str, "pnl_usd": pnl_usd, "pnl_pct": pnl_pct})
     return out
 
@@ -573,6 +618,54 @@ def _load_dashboard_snapshots() -> List[Dict[str, Any]]:
         return []
 
 
+def _max_drawdown_pct_all_time(
+    trades: List[Dict[str, Any]],
+    current_equity: Optional[float],
+) -> Optional[float]:
+    """All-time max drawdown % from trade PnL equity curve (peak-to-trough). Matches Hyperliquid-style all-time max drawdown."""
+    if current_equity is None or not trades:
+        return None
+    try:
+        eq_now = float(current_equity)
+    except (TypeError, ValueError):
+        return None
+    if eq_now <= 0:
+        return None
+    pts = []
+    total_pnl = 0.0
+    for t in trades or []:
+        if not isinstance(t, dict):
+            continue
+        close_dt = _parse_trade_time(t)
+        if close_dt is None:
+            continue
+        try:
+            pnl = float(t.get("pnl_usd", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        total_pnl += pnl
+        pts.append((close_dt, pnl))
+    if not pts:
+        return None
+    # Start equity = current - cumulative PnL (deposit-neutral trading curve)
+    start_equity = eq_now - total_pnl
+    if start_equity <= 0:
+        return None
+    pts.sort(key=lambda x: x[0])
+    equity = start_equity
+    peak = equity
+    max_dd_pct = 0.0
+    for _, pnl in pts:
+        equity += pnl
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            dd_pct = (peak - equity) / peak * 100.0
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
+    return round(max_dd_pct, 2)
+
+
 def _max_drawdown_pct_from_snapshots_since(since_dt: datetime) -> Optional[float]:
     """Max drawdown % from equity snapshots since a given time (relative to peak equity)."""
     if since_dt.tzinfo is not None:
@@ -666,7 +759,7 @@ def _dashboard_daily_equity_update_and_get(current_equity: Optional[float]) -> L
         except Exception:
             pass
 
-    # Daily PnL: diff between consecutive UTC-midnight equity snapshots.
+    # Daily PnL: diff between consecutive UTC-midnight equity snapshots. Attribute to cur day (the day the PnL occurred).
     daily = []
     for i in range(1, len(parsed)):
         prev = parsed[i - 1]
@@ -676,18 +769,56 @@ def _dashboard_daily_equity_update_and_get(current_equity: Optional[float]) -> L
         if prev["equity"] and prev["equity"] > 0:
             pnl_pct = round((pnl / prev["equity"]) * 100, 2)
         daily.append({
-            "day": prev["day"].isoformat(),
+            "day": cur["day"].isoformat(),
             "pnl_usd": pnl,
             "pnl_pct": pnl_pct,
         })
     return daily
 
 
+def _net_deposit_withdrawal_since(
+    deposit_withdrawal_history: Optional[List[Dict[str, Any]]],
+    since_dt: datetime,
+) -> float:
+    """Sum of (deposits - withdrawals) since since_dt. Positive = net deposit into account. Used to adjust derived start equity for APR."""
+    if not deposit_withdrawal_history:
+        return 0.0
+    if since_dt.tzinfo is not None:
+        since_dt = since_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    total = 0.0
+    for item in deposit_withdrawal_history:
+        if not isinstance(item, dict):
+            continue
+        raw_time = item.get("time")
+        if not raw_time:
+            continue
+        try:
+            s = str(raw_time).strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        if dt < since_dt:
+            continue
+        try:
+            amt = float(item.get("amount_usd", 0) or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        kind = (item.get("type") or "transfer").strip().lower()
+        if kind == "deposit":
+            total += amt
+        elif kind == "withdrawal":
+            total -= amt
+    return round(total, 2)
+
+
 def _dashboard_apr_apy(
     current_equity: Optional[float],
     all_trades: Optional[List[Dict[str, Any]]] = None,
+    deposit_withdrawal_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Optional[float]]:
-    """Compute 1d/7d/30d APR and 30d APY from past equity + trading PnL (deposit-neutral). Returns pct values."""
+    """Compute 1d/7d/30d APR and 30d APY from past equity + trading PnL (deposit-neutral). Uses deposit/withdrawal history to adjust derived start equity when no snapshot exists."""
     out = {"apr_1d_pct": None, "apr_7d_pct": None, "apr_30d_pct": None, "apy_30d_pct": None}
     try:
         eq_now = float(current_equity) if current_equity is not None else None
@@ -737,15 +868,30 @@ def _dashboard_apr_apy(
         eq_effective_1d = eq_1d + pnl_1d
         if eq_effective_1d > 0:
             out["apr_1d_pct"] = round((eq_effective_1d / eq_1d - 1) * 365 * 100, 2)
+    since_7d = now_utc - timedelta(days=7)
+    since_30d = now_utc - timedelta(days=30)
+    net_flow_7d = _net_deposit_withdrawal_since(deposit_withdrawal_history, since_7d)
+    net_flow_30d = _net_deposit_withdrawal_since(deposit_withdrawal_history, since_30d)
+
+    # 7d APR: use snapshot if available; else use net deposits in period as starting amount when positive
     if eq_7d and eq_7d > 0:
         eq_effective_7d = eq_7d + pnl_7d
         if eq_effective_7d > 0:
             out["apr_7d_pct"] = round((eq_effective_7d / eq_7d - 1) * (365 / 7) * 100, 2)
+    else:
+        # No snapshot: use net deposits in last 7d as starting amount (return on capital added in period)
+        eq_7d_start = net_flow_7d if net_flow_7d and net_flow_7d > 0 else None
+        if not eq_7d_start:
+            eq_7d_start = (eq_now - pnl_7d - net_flow_7d) if (eq_now is not None and pnl_7d is not None) else None
+        if eq_7d_start and eq_7d_start > 0 and eq_now and eq_now > 0:
+            out["apr_7d_pct"] = round((eq_now / eq_7d_start - 1) * (365 / 7) * 100, 2)
+    # 30d APR/APY: only when we have a snapshot from 30 days ago (full 30-day period). No partial-data extrapolation.
     if eq_30d and eq_30d > 0:
         eq_effective_30d = eq_30d + pnl_30d
         if eq_effective_30d > 0:
             out["apr_30d_pct"] = round((eq_effective_30d / eq_30d - 1) * (365 / 30) * 100, 2)
             out["apy_30d_pct"] = round((pow(eq_effective_30d / eq_30d, 365 / 30) - 1) * 100, 2)
+    # Else: do not show 30d APR/APY until 30 days of snapshot data exist (avoids misleading partial-period numbers)
     return out
 
 
@@ -940,8 +1086,24 @@ def _enrich_last_trades_with_volume(perf: Dict[str, Any], last_trades: list) -> 
     return out
 
 
+def _is_real_closed_trade(t: Dict[str, Any]) -> bool:
+    """True if trade has duration/opened_at (real round-trip close), or time+pnl_usd (exchange close fill). Excludes fee-only or fills-only closes with no open time."""
+    if not isinstance(t, dict):
+        return False
+    if t.get("duration_seconds") is not None:
+        return True
+    opened = t.get("opened_at")
+    if opened is not None and opened != "":
+        return True
+    # Live HL fills have close time + pnl but no opened_at/duration; still show them
+    if t.get("time") is not None and t.get("pnl_usd") is not None:
+        return True
+    return False
+
+
 def _compute_summary(perf: Dict[str, Any], positions: Dict[str, Any]) -> Dict[str, Any]:
-    last_10 = perf.get("last_10", []) if isinstance(perf, dict) else []
+    last_10_raw = perf.get("last_10", []) if isinstance(perf, dict) else []
+    last_10 = [t for t in last_10_raw if _is_real_closed_trade(t)]
     last_trades_raw = perf.get("last_trades", []) if isinstance(perf, dict) else []
     last_trades = _enrich_last_trades_with_volume(perf, last_trades_raw)
     # Prefer win rate from actual closed-trade PnL (fixes wrong 100% when signals aggregates are off)
@@ -1251,6 +1413,8 @@ def _merge_live_into_summary(
     if "open_positions" in live and isinstance(live["open_positions"], list):
         out["open_positions"] = live["open_positions"]
         out["open_positions_count"] = len(live["open_positions"])
+    if "deposit_withdrawal_history" in live and isinstance(live["deposit_withdrawal_history"], list):
+        out["deposit_withdrawal_history"] = live["deposit_withdrawal_history"]
     # Only overwrite chart/stats from live when requested (no file-based trades). Otherwise keep file-based so dashboard stays stable.
     if not merge_trades_and_stats:
         return out
@@ -1258,6 +1422,7 @@ def _merge_live_into_summary(
         since_dt = _get_performance_since() if filter_since else None
         all_trades = list(live["all_trades"])
         last_10_trades = list(live.get("last_10_trades") or [])
+        last_10_trades = [t for t in last_10_trades if _is_real_closed_trade(t)]
         if since_dt:
             all_trades = [t for t in all_trades if isinstance(t, dict) and _parse_trade_time(t) and _parse_trade_time(t) >= since_dt]
             last_10_trades = [t for t in last_10_trades if isinstance(t, dict) and _parse_trade_time(t) and _parse_trade_time(t) >= since_dt]
@@ -1321,7 +1486,11 @@ def _apply_equity_based_pnl_pct(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.get("/portfolio")
-async def get_portfolio_dashboard(range_filter: Optional[str] = Query(None, alias="range")):
+async def get_portfolio_dashboard(
+    range_filter: Optional[str] = Query(None, alias="range"),
+    include_market_cap: bool = Query(False, alias="include_market_cap"),
+    market_cap_days: int = Query(365, ge=7, le=365),
+):
     """Hyperliquid portfolio summary for dashboard. Uses live positions/equity when env is set. Query param range=24h|7d|30d|all filters overview and per-symbol PnL to that window."""
     try:
         hl_perf = _load_json(HL_PERF_PATH)
@@ -1356,15 +1525,26 @@ async def get_portfolio_dashboard(range_filter: Optional[str] = Query(None, alia
                         print(f"⚠️  Live Hyperliquid fetch failed: {e}", flush=True)
                         traceback.print_exc()
             if live_hl:
-                # If using live trades, do NOT apply performance-since filter; show full account history
+                # Merge live trades; respect dashboard_performance_since.json when set (fresh restart).
                 hl_summary = _merge_live_into_summary(
                     hl_summary,
                     live_hl,
                     merge_trades_and_stats=use_live_trades,
-                    filter_since=False,
+                    filter_since=True,
                 )
         # Align total PnL% to equity (clearer than ROE on margin)
         hl_summary = _apply_equity_based_pnl_pct(hl_summary)
+
+        # When there are no trades (e.g. after dashboard reset), clear ratio stats so cards show "—" not stale values
+        all_trades = hl_summary.get("all_trades") or []
+        if not all_trades:
+            hl_summary["win_rate_pct"] = None
+            hl_summary["sharpe_ratio"] = None
+            hl_summary["sortino_ratio"] = None
+            hl_summary["profit_factor"] = None
+            ob = hl_summary.get("overview_breakdown") or {}
+            if isinstance(ob, dict) and "total" in ob and isinstance(ob["total"], dict):
+                ob["total"]["win_rate_pct"] = None
 
         # Rolling 24h: append current metrics to persisted snapshots, get values closest to 24h ago (or oldest)
         values_24h = _dashboard_snapshots_update_and_get_24h(
@@ -1399,24 +1579,30 @@ async def get_portfolio_dashboard(range_filter: Optional[str] = Query(None, alia
         else:
             hl_summary["daily_pnl"] = daily_from_equity
 
-        # Max drawdown % since yesterday (UTC midnight) using equity snapshots (peak-to-trough)
-        today_utc = datetime.now(timezone.utc).date()
-        yesterday_utc = today_utc - timedelta(days=1)
-        yesterday_start = datetime.combine(yesterday_utc, datetime.min.time(), tzinfo=timezone.utc)
-        max_dd_pct = _max_drawdown_pct_from_snapshots_since(yesterday_start)
+        # Max drawdown %: all-time from trade equity curve (to match Hyperliquid All-time Max Drawdown)
+        max_dd_pct = _max_drawdown_pct_all_time(all_trades, eq_now_f)
         if max_dd_pct is None:
-            # Fallback to trade-based curve if snapshots are missing
-            start_equity = equity_by_day.get(yesterday_utc.isoformat())
-            if start_equity is None and eq_now_f is not None:
-                pnl_since_yesterday = _trading_pnl_since(all_trades, yesterday_start)
-                start_equity = round(eq_now_f - pnl_since_yesterday, 2)
-            max_dd_pct = _max_drawdown_pct_since(all_trades, yesterday_start, start_equity)
+            # Fallback: since yesterday from equity snapshots or trade-based curve
+            today_utc = datetime.now(timezone.utc).date()
+            yesterday_utc = today_utc - timedelta(days=1)
+            yesterday_start = datetime.combine(yesterday_utc, datetime.min.time(), tzinfo=timezone.utc)
+            max_dd_pct = _max_drawdown_pct_from_snapshots_since(yesterday_start)
+            if max_dd_pct is None:
+                start_equity = equity_by_day.get(yesterday_utc.isoformat())
+                if start_equity is None and eq_now_f is not None:
+                    pnl_since_yesterday = _trading_pnl_since(all_trades, yesterday_start)
+                    start_equity = round(eq_now_f - pnl_since_yesterday, 2)
+                max_dd_pct = _max_drawdown_pct_since(all_trades, yesterday_start, start_equity)
         if isinstance(hl_summary.get("overview_breakdown"), dict):
             total_bucket = hl_summary["overview_breakdown"].get("total")
             if isinstance(total_bucket, dict):
                 total_bucket["max_drawdown_pct"] = max_dd_pct
         hl_summary["max_drawdown_pct"] = max_dd_pct
-        apr_apy = _dashboard_apr_apy(hl_summary.get("equity"), all_trades=all_trades)
+        apr_apy = _dashboard_apr_apy(
+            hl_summary.get("equity"),
+            all_trades=all_trades,
+            deposit_withdrawal_history=hl_summary.get("deposit_withdrawal_history"),
+        )
         hl_summary["apr_1d_pct"] = apr_apy.get("apr_1d_pct")
         hl_summary["apr_7d_pct"] = apr_apy.get("apr_7d_pct")
         hl_summary["apr_30d_pct"] = apr_apy.get("apr_30d_pct")
@@ -1439,6 +1625,7 @@ async def get_portfolio_dashboard(range_filter: Optional[str] = Query(None, alia
             range_val = "all"
         hl_summary["range"] = range_val
         hl_summary["per_symbol_pnl"] = _per_symbol_pnl(trades_for_range, eq_now_f)
+        hl_summary["trader_actions"] = _load_trader_actions()
         if range_val != "all":
             range_stats = _trade_stats(trades_for_range)
             hl_summary["overview_breakdown"] = range_stats.get("overview_breakdown") or hl_summary.get("overview_breakdown")
@@ -1447,12 +1634,24 @@ async def get_portfolio_dashboard(range_filter: Optional[str] = Query(None, alia
                 total_bucket["max_drawdown_pct"] = None  # range-specific drawdown not computed
             hl_summary = _apply_equity_based_pnl_pct(hl_summary)
 
+        response_payload = {
+            "ok": True,
+            "t": datetime.now().isoformat(),
+            "hyperliquid": hl_summary,
+        }
+        if include_market_cap:
+            now = time.time()
+            market_series = None
+            if _market_cap_cache["data"] is not None and (now - _market_cap_cache["ts"]) < _MARKET_CAP_CACHE_TTL_SEC:
+                market_series = _market_cap_cache["data"]
+            else:
+                market_series = await asyncio.to_thread(_fetch_btc_daily_candles, market_cap_days)
+                if market_series is not None:
+                    _market_cap_cache["data"] = market_series
+                    _market_cap_cache["ts"] = now
+            response_payload["market_cap"] = market_series if market_series else []
         return JSONResponse(
-            {
-                "ok": True,
-                "t": datetime.now().isoformat(),
-                "hyperliquid": hl_summary,
-            },
+            response_payload,
             headers={"Cache-Control": "no-store, max-age=0"},
         )
     except Exception as e:
@@ -1470,6 +1669,7 @@ async def get_portfolio_dashboard(range_filter: Optional[str] = Query(None, alia
                     "open_positions_count": 0,
                     "last_10_trades": [],
                     "all_trades": [],
+                    "trader_actions": [],
                     "win_rate_pct": None,
                     "total_trades": 0,
                     "last_10_pnl_usd": None,
@@ -1505,13 +1705,72 @@ async def get_portfolio_dashboard(range_filter: Optional[str] = Query(None, alia
         )
 
 
-@app.get("/portfolio-settings")
-async def get_portfolio_settings():
-    """Load trader + batch API settings snapshots for dashboard."""
-    return {
-        "trader": _load_json(TRADER_SETTINGS_PATH),
-        "batch_api": _load_json(BATCH_SETTINGS_PATH),
-    }
+@app.get("/trader-actions")
+async def get_trader_actions():
+    """Lightweight endpoint for the dashboard to poll trader actions every 30s."""
+    try:
+        actions = _load_trader_actions()
+        return JSONResponse(
+            {"ok": True, "actions": actions},
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+    except Exception:
+        return JSONResponse({"ok": False, "actions": []})
+
+
+# In-memory cache for BTC price history (proxy for total crypto market). TTL 1 hour.
+_market_cap_cache: Dict[str, Any] = {"data": None, "ts": 0}
+_MARKET_CAP_CACHE_TTL_SEC = 3600
+
+
+def _fetch_btc_daily_candles(days: int = 365) -> Optional[List[List[float]]]:
+    """Fetch BTC daily close prices from Hyperliquid as a crypto market proxy.
+    Returns [[timestamp_ms, close_price], ...] or None.
+    BTC correlates strongly with TOTAL crypto market cap (~0.95+)."""
+    import urllib.request
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - days * 86400 * 1000
+    payload = json.dumps({
+        "type": "candleSnapshot",
+        "req": {"coin": "BTC", "interval": "1d", "startTime": start_ms, "endTime": now_ms}
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            "https://api.hyperliquid.xyz/info",
+            data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            candles = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    if not candles or not isinstance(candles, list):
+        return None
+    # Return [[timestamp_ms, close_price], ...] sorted by time
+    series = []
+    for c in candles:
+        ts = int(c.get("t", 0))
+        close = float(c.get("c", 0))
+        if ts > 0 and close > 0:
+            series.append([ts, close])
+    series.sort(key=lambda x: x[0])
+    return series if series else None
+
+
+@app.get("/market-cap-history")
+async def get_market_cap_history(days: int = Query(365, ge=7, le=365)):
+    """Return BTC daily prices as crypto market proxy for dashboard overlay. Cached 1 hour. Source: Hyperliquid."""
+    now = time.time()
+    if _market_cap_cache["data"] is not None and (now - _market_cap_cache["ts"]) < _MARKET_CAP_CACHE_TTL_SEC:
+        return JSONResponse({"ok": True, "market_cap": _market_cap_cache["data"]})
+    series = await asyncio.to_thread(_fetch_btc_daily_candles, days)
+    if series is not None:
+        _market_cap_cache["data"] = series
+        _market_cap_cache["ts"] = now
+    return JSONResponse(
+        {"ok": series is not None, "market_cap": series if series else []},
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 @app.get("/portfolio-dashboard", response_class=HTMLResponse)
@@ -1554,6 +1813,10 @@ async def portfolio_dashboard():
     .diff-24h.danger { color: var(--danger); }
     .diff-24h.muted { color: var(--muted); }
     .section-title { font-size: 16px; margin: 4px 0 0; }
+    .trader-actions-item { padding: 8px 0; border-bottom: 1px solid #1f2a3c; }
+    .trader-actions-item:last-child { border-bottom: none; }
+    .trader-actions-header { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+    .trader-actions-body { font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; white-space: pre-wrap; word-break: break-word; }
     .overview-grid { display: grid; gap: 14px; margin-top: 10px; grid-template-columns: minmax(240px, 0.8fr) minmax(320px, 1.2fr); align-items: start; }
     @media (max-width: 900px) { .overview-grid { grid-template-columns: 1fr; } }
     .calendar-panel { display: flex; flex-direction: column; gap: 8px; min-height: 260px; }
@@ -1576,14 +1839,6 @@ async def portfolio_dashboard():
     .calendar-cell.positive { background: rgba(56, 211, 159, 0.12); border-color: rgba(56, 211, 159, 0.35); }
     .calendar-cell.negative { background: rgba(255, 122, 122, 0.12); border-color: rgba(255, 122, 122, 0.35); }
     .calendar-cell.neutral { background: rgba(138, 160, 181, 0.08); }
-    .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
-    .settings-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
-    .settings-body { max-height: 420px; overflow-y: auto; border-radius: 12px; }
-    .settings-subtitle { margin: 10px 0 6px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
-    .settings-table { font-size: 11px; }
-    .settings-table td { vertical-align: top; }
-    .settings-name { width: 42%; color: var(--muted); }
-    .settings-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
     th, td { padding: 8px; border-bottom: 1px solid #1f2a3c; text-align: left; }
     th { color: var(--muted); font-weight: 600; }
@@ -1614,6 +1869,37 @@ async def portfolio_dashboard():
     .chart-area { opacity: 0.15; }
     .chart-area.positive { fill: var(--success); }
     .chart-area.negative { fill: var(--danger); }
+    .chart-compare-stats {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .chart-compare-stats[hidden] { display: none !important; }
+    .chart-compare-stat {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.02);
+      padding: 8px 10px;
+    }
+    .chart-compare-stat .k {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .chart-compare-stat .v {
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .chart-compare-period {
+      margin-top: 6px;
+      font-size: 11px;
+      color: var(--muted);
+      text-align: right;
+    }
+    @media (max-width: 860px) {
+      .chart-compare-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
     .flash-up { animation: glow-green 1.4s ease-out; }
     .flash-down { animation: glow-red 1.4s ease-out; }
     @keyframes glow-green {
@@ -1635,9 +1921,34 @@ async def portfolio_dashboard():
   </header>
   <div class="container">
     <div class="panel chart-panel">
-      <h2>Portfolio performance</h2>
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+        <h2 style="margin:0;">Portfolio performance</h2>
+        <label class="chart-toggle" style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:14px; color:var(--muted);">
+          <input type="checkbox" id="pnl-chart-show-marketcap" autocomplete="off" />
+          <span>Compare to BTC (market proxy)</span>
+        </label>
+      </div>
       <div class="chart-wrapper">
         <div class="chart-container" id="pnl-chart-container"></div>
+        <div class="chart-compare-stats" id="pnl-chart-compare-stats" hidden>
+          <div class="chart-compare-stat">
+            <div class="k">Portfolio return</div>
+            <div class="v" id="cmp-portfolio-ret">—</div>
+          </div>
+          <div class="chart-compare-stat">
+            <div class="k">BTC return</div>
+            <div class="v" id="cmp-btc-ret">—</div>
+          </div>
+          <div class="chart-compare-stat">
+            <div class="k">Alpha vs BTC (pp)</div>
+            <div class="v" id="cmp-alpha-pp">—</div>
+          </div>
+          <div class="chart-compare-stat">
+            <div class="k">Relative outperformance</div>
+            <div class="v" id="cmp-relative-out">—</div>
+          </div>
+        </div>
+        <div class="chart-compare-period" id="cmp-period-label" hidden>—</div>
         <div class="chart-overview-wrap" id="pnl-chart-overview-wrap" style="display:none;">
           <div class="chart-overview-svg" id="pnl-chart-overview"></div>
         </div>
@@ -1675,9 +1986,37 @@ async def portfolio_dashboard():
               <button class="calendar-btn" id="pnl-calendar-next" aria-label="Next month">›</button>
             </div>
           </div>
+          <div class="calendar-avg-pnl-pct muted" id="pnl-calendar-avg-pct" style="font-size:12px; margin-bottom:8px;"></div>
           <div class="calendar-weekdays" id="pnl-calendar-weekdays"></div>
           <div class="calendar-grid" id="pnl-calendar-grid"></div>
         </div>
+      </div>
+      <div class="section-title">Trader actions</div>
+      <div class="panel" style="margin-top:10px;">
+        <p class="muted" style="margin:0 0 8px 0; font-size:0.9em;">Live stream of actions the trader takes (opens, closes, SL upgrades) — same messages sent to Telegram.</p>
+        <div id="hl-trader-actions" style="max-height:280px; overflow-y:auto; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-word; padding:8px; background:rgba(0,0,0,0.2); border-radius:8px;"></div>
+      </div>
+      <div class="section-title">Open Positions (Live)</div>
+      <div class="panel" style="margin-top:10px; max-height:320px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Side</th><th>Entry</th><th>Size ($)</th><th>PnL ($)</th><th>PnL %</th><th>Qty</th><th>Lev</th><th>Duration</th>
+            </tr>
+          </thead>
+          <tbody id="hl-positions"></tbody>
+        </table>
+      </div>
+      <div class="section-title">Last 10 closed positions</div>
+      <div class="panel" style="margin-top:10px; max-height:320px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Side</th><th>PnL ($)</th><th>PnL %</th><th>Duration</th><th>Closed</th>
+            </tr>
+          </thead>
+          <tbody id="hl-last-10-closed"></tbody>
+        </table>
       </div>
       <div class="section-title" id="per-symbol-pnl-title">Per symbol PnL</div>
       <div class="panel" style="margin-top:10px; max-height:320px; overflow-y:auto;">
@@ -1695,62 +2034,21 @@ async def portfolio_dashboard():
           <tbody id="per-symbol-pnl-body"></tbody>
         </table>
       </div>
-      <div class="section-title">Open Positions (Live)</div>
-      <div class="panel" style="margin-top:10px; max-height:320px; overflow-y:auto;">
-        <table>
+      <div class="section-title">Deposit / Withdrawal history</div>
+      <div class="panel" style="margin-top:10px;">
+        <p class="muted" style="margin:0 0 12px 0;">Recent USDC deposits and withdrawals (from Hyperliquid). PnL and APR on this dashboard are trading-only and do not include these flows.</p>
+        <table style="margin-top:8px;">
           <thead>
             <tr>
-              <th>Symbol</th><th>Side</th><th>Entry</th><th>Size ($)</th><th>PnL ($)</th><th>PnL %</th><th>Qty</th><th>Lev</th><th>Opened</th>
+              <th>Type</th><th>Amount</th><th>Time</th><th>Tx</th>
             </tr>
           </thead>
-          <tbody id="hl-positions"></tbody>
+          <tbody id="hl-deposit-withdrawal-history"></tbody>
         </table>
-      </div>
-      <div class="section-title">Deposit / Withdrawal</div>
-      <div class="panel" style="margin-top:10px;">
-        <p class="muted" style="margin:0 0 12px 0;">Move USDC to and from your Hyperliquid perpetuals account. PnL and APR on this dashboard are trading-only (deposits and withdrawals do not affect them).</p>
-        <div style="margin-top:8px; display:flex; gap:12px; flex-wrap:wrap;">
-          <a href="https://app.hyperliquid.xyz/withdraw" target="_blank" rel="noopener noreferrer" style="display:inline-flex; align-items:center; gap:8px; padding:12px 16px; text-decoration:none; color:var(--accent); border:1px solid rgba(255,255,255,0.14); border-radius:12px; font-weight:600; background:var(--panel);">Deposit →</a>
-          <a href="https://app.hyperliquid.xyz/withdraw" target="_blank" rel="noopener noreferrer" style="display:inline-flex; align-items:center; gap:8px; padding:12px 16px; text-decoration:none; color:var(--accent); border:1px solid rgba(255,255,255,0.14); border-radius:12px; font-weight:600; background:var(--panel);">Withdraw →</a>
-        </div>
-      </div>
-      <div class="section-title">Settings</div>
-      <div class="settings-grid">
-        <div class="panel">
-          <div class="settings-header">
-            <span>Trader</span>
-            <span class="muted" id="trader-settings-meta">—</span>
-          </div>
-          <div class="settings-body">
-            <table class="settings-table">
-              <thead>
-                <tr><th>Setting</th><th>Value</th></tr>
-              </thead>
-              <tbody id="trader-settings-body"></tbody>
-            </table>
-          </div>
-        </div>
-        <div class="panel">
-          <div class="settings-header">
-            <span>Batch API</span>
-            <span class="muted" id="batch-settings-meta">—</span>
-          </div>
-          <div class="settings-body">
-            <div class="settings-subtitle">Liquidation Heatmap API</div>
-            <table class="settings-table">
-              <thead>
-                <tr><th>Setting</th><th>Value</th></tr>
-              </thead>
-              <tbody id="batch-settings-heatmap"></tbody>
-            </table>
-            <div class="settings-subtitle">Hyperliquid Batch</div>
-            <table class="settings-table">
-              <thead>
-                <tr><th>Setting</th><th>Value</th></tr>
-              </thead>
-              <tbody id="batch-settings-hyperliquid"></tbody>
-            </table>
-          </div>
+        <p class="muted" style="margin-top:8px; font-size:0.9em;">No history when live fetch is disabled or unavailable.</p>
+        <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap;">
+          <a href="https://app.hyperliquid.xyz/withdraw" target="_blank" rel="noopener noreferrer" style="display:inline-flex; align-items:center; gap:8px; padding:8px 12px; text-decoration:none; color:var(--accent); border:1px solid rgba(255,255,255,0.14); border-radius:8px; font-size:0.9em;">Deposit →</a>
+          <a href="https://app.hyperliquid.xyz/withdraw" target="_blank" rel="noopener noreferrer" style="display:inline-flex; align-items:center; gap:8px; padding:8px 12px; text-decoration:none; color:var(--accent); border:1px solid rgba(255,255,255,0.14); border-radius:8px; font-size:0.9em;">Withdraw →</a>
         </div>
       </div>
     </div>
@@ -1778,7 +2076,7 @@ async def portfolio_dashboard():
         { key: "sharpe_ratio", label: `${labelPrefix}Sharpe Ratio`, value: data.sharpe_ratio ?? "—", number: true, show24h: true, prevKey: "sharpe_ratio_24h_ago", tooltip: "Risk-adjusted return: average PnL per trade ÷ standard deviation of PnL. Higher is better; above 1 is often considered good." },
         { key: "sortino_ratio", label: `${labelPrefix}Sortino Ratio`, value: data.sortino_ratio ?? "—", number: true, show24h: true, prevKey: "sortino_ratio_24h_ago", tooltip: "Risk-adjusted return using downside deviation only (penalizes losses more than gains)." },
         { key: "profit_factor", label: `${labelPrefix}Profit Factor`, value: data.profit_factor ?? "—", number: true, show24h: true, prevKey: "profit_factor_24h_ago", tooltip: "Gross profit ÷ gross loss from closed trades. Above 1 means total profits exceed total losses." },
-        { key: "max_drawdown_pct", label: `${labelPrefix}Max Drawdown %`, value: data.max_drawdown_pct ?? "—", pctMinus: true, pnlNegative: true, tooltip: "Maximum peak-to-trough equity drop since yesterday, expressed as % of equity." },
+        { key: "max_drawdown_pct", label: `${labelPrefix}Max Drawdown %`, value: data.max_drawdown_pct ?? "—", pctMinus: true, pnlNegative: true, tooltip: "All-time maximum peak-to-trough equity drop from trading curve, as % of peak (matches Hyperliquid All-time)." },
       ];
       const diff24h = (cur, prev, key) => {
         if (cur == null || prev == null || prev === "" || prev === "—") return null;
@@ -1991,6 +2289,39 @@ async def portfolio_dashboard():
       });
     };
 
+    const renderCalendarAvgDailyPnlPct = (dailyPnl, range) => {
+      const el = document.getElementById("pnl-calendar-avg-pct");
+      if (!el) return;
+      const entries = Array.isArray(dailyPnl) ? dailyPnl : [];
+      const today = new Date();
+      const todayIso = today.getUTCFullYear() + "-" + String(today.getUTCMonth() + 1).padStart(2, "0") + "-" + String(today.getUTCDate()).padStart(2, "0");
+      let cutoffIso = null;
+      if (range === "24h") {
+        const d = new Date(today);
+        d.setUTCDate(d.getUTCDate() - 1);
+        cutoffIso = d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0");
+      } else if (range === "7d") {
+        const d = new Date(today);
+        d.setUTCDate(d.getUTCDate() - 7);
+        cutoffIso = d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0");
+      } else if (range === "30d") {
+        const d = new Date(today);
+        d.setUTCDate(d.getUTCDate() - 30);
+        cutoffIso = d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0");
+      }
+      const filtered = cutoffIso == null ? entries : entries.filter((e) => e && e.day && String(e.day) >= cutoffIso && String(e.day) < todayIso);
+      const withPct = filtered.filter((e) => e.pnl_pct != null && !isNaN(Number(e.pnl_pct)));
+      if (withPct.length === 0) {
+        el.textContent = "Avg daily PnL % (" + (range || "all") + "): —";
+        el.style.color = "";
+        return;
+      }
+      const avg = withPct.reduce((s, e) => s + Number(e.pnl_pct), 0) / withPct.length;
+      const label = (range && range !== "all") ? range : "all";
+      el.textContent = "Avg daily PnL % (" + label + "): " + (avg >= 0 ? "+" : "") + avg.toFixed(2) + "% (" + withPct.length + " days)";
+      el.style.color = avg >= 0 ? "var(--success)" : "var(--danger)";
+    };
+
     const renderPnlCalendar = (dailyPnl) => {
       const grid = document.getElementById("pnl-calendar-grid");
       const weekdays = document.getElementById("pnl-calendar-weekdays");
@@ -2084,7 +2415,22 @@ async def portfolio_dashboard():
         const pnlPctDisplay = pnlPct != null ? (pnlPct >= 0 ? "+" : "") + fmt(pnlPct, 2) + "%" : "—";
         const pnlUsdDisplay = pnlUsd != null ? (pnlUsd >= 0 ? "+" : "") + "$" + fmt(Math.abs(pnlUsd), 2) : "—";
         const sizeUsd = p.position_size_usd != null ? "$" + fmt(p.position_size_usd, 2) : "—";
-        const opened = p.opened_at != null && p.opened_at !== "" ? fmtTime(p.opened_at) : "—";
+        const durationDisplay = (() => {
+          const at = p.opened_at;
+          if (!at || at === "") return "—";
+          try {
+            const openMs = new Date(at).getTime();
+            if (isNaN(openMs)) return "—";
+            let sec = Math.floor((Date.now() - openMs) / 1000);
+            if (sec < 0) return "—";
+            if (sec < 60) return sec + "s";
+            if (sec < 3600) return Math.floor(sec / 60) + "m";
+            if (sec < 86400) return Math.floor(sec / 3600) + "h " + (Math.floor((sec % 3600) / 60)) + "m";
+            const d = Math.floor(sec / 86400);
+            const h = Math.floor((sec % 86400) / 3600);
+            return d + "d " + h + "h";
+          } catch (e) { return "—"; }
+        })();
         return `
         <tr>
           <td>${p.symbol}</td>
@@ -2095,7 +2441,7 @@ async def portfolio_dashboard():
           <td class="${pnlClass}">${pnlPctDisplay}</td>
           <td>${fmt(p.entry_qty, 4)}</td>
           <td>${fmt(p.leverage, 1)}x</td>
-          <td>${opened}</td>
+          <td>${durationDisplay}</td>
         </tr>
       `;
       }).join("");
@@ -2118,71 +2464,143 @@ async def portfolio_dashboard():
       root.innerHTML = rows + totalsRow;
     };
 
-    const formatSettingValue = (v) => {
-      if (v === null || v === undefined) return "—";
-      if (typeof v === "string") return v;
-      try {
-        return JSON.stringify(v);
-      } catch (e) {
-        return String(v);
-      }
-    };
-
-    const renderSettingsTable = (root, settings) => {
+    const renderLast10Closed = (root, trades) => {
       if (!root) return;
-      const entries = settings && typeof settings === "object" ? Object.entries(settings) : [];
-      if (entries.length === 0) {
-        root.innerHTML = `<tr><td class="muted" colspan="2">No settings found</td></tr>`;
+      if (!trades || trades.length === 0) {
+        root.innerHTML = `<tr><td class="muted" colspan="6">No closed positions in last 10</td></tr>`;
         return;
       }
-      entries.sort((a, b) => a[0].localeCompare(b[0]));
-      root.innerHTML = entries.map(([key, value]) => {
-        const val = escapeHtml(formatSettingValue(value));
-        return `<tr><td class="settings-name">${escapeHtml(key)}</td><td class="settings-value">${val}</td></tr>`;
+      const formatDurationSec = (sec) => {
+        if (sec == null || sec < 0) return "—";
+        const s = Number(sec);
+        if (s < 60) return s + "s";
+        if (s < 3600) return Math.floor(s / 60) + "m";
+        if (s < 86400) return Math.floor(s / 3600) + "h " + (Math.floor((s % 3600) / 60)) + "m";
+        const d = Math.floor(s / 86400);
+        const h = Math.floor((s % 86400) / 3600);
+        return d + "d " + h + "h";
+      };
+      const rows = trades.map(t => {
+        const side = t.entry_side || t.side || "—";
+        const pnlUsd = t.pnl_usd != null ? Number(t.pnl_usd) : null;
+        const pnlPct = t.pnl_pct != null ? Number(t.pnl_pct) : null;
+        const pnlClass = (pnlPct != null || pnlUsd != null) ? (Math.max(pnlPct || 0, pnlUsd || 0) >= 0 ? "value success" : "value danger") : "";
+        const pnlUsdDisplay = pnlUsd != null ? (pnlUsd >= 0 ? "+" : "-") + "$" + fmt(Math.abs(pnlUsd), 2) : "—";
+        const pnlPctDisplay = pnlPct != null ? (pnlPct >= 0 ? "+" : "") + fmt(pnlPct, 2) + "%" : "—";
+        const closed = t.time ? fmtTime(t.time) : "—";
+        const durationDisplay = t.duration_seconds != null ? formatDurationSec(t.duration_seconds) : "—";
+        return `
+        <tr>
+          <td>${escapeHtml(String(t.symbol || "—"))}</td>
+          <td><span class="pill ${String(side).toLowerCase().includes('short') ? 'short' : 'long'}">${escapeHtml(String(side))}</span></td>
+          <td class="${pnlClass}">${pnlUsdDisplay}</td>
+          <td class="${pnlClass}">${pnlPctDisplay}</td>
+          <td class="muted">${durationDisplay}</td>
+          <td class="muted">${closed}</td>
+        </tr>`;
       }).join("");
+      root.innerHTML = rows;
     };
 
-    const renderSettingsMeta = (root, data) => {
+    const formatDuration = (seconds) => {
+      if (seconds == null || seconds < 0) return "—";
+      const s = Number(seconds);
+      if (s < 60) return s + "s";
+      if (s < 3600) return Math.floor(s / 60) + "m";
+      if (s < 86400) return Math.floor(s / 3600) + "h " + (Math.floor((s % 3600) / 60)) + "m";
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      return d + "d " + h + "h";
+    };
+
+    const renderTraderActions = (root, actions) => {
       if (!root) return;
-      const ts = data && data.generated_at ? data.generated_at : null;
-      const pid = data && data.pid ? data.pid : null;
-      root.textContent = ts ? ("Updated " + fmtTime(ts) + (pid ? " · PID " + pid : "")) : "No snapshot";
-    };
-
-    const fetchSettings = async () => {
-      try {
-        const res = await fetch("/portfolio-settings?_t=" + Date.now());
-        if (!res.ok) throw new Error("settings fetch failed");
-        const data = await res.json();
-        const trader = data && data.trader ? data.trader : {};
-        const batch = data && data.batch_api ? data.batch_api : {};
-        renderSettingsMeta(document.getElementById("trader-settings-meta"), trader);
-        renderSettingsMeta(document.getElementById("batch-settings-meta"), batch);
-        renderSettingsTable(document.getElementById("trader-settings-body"), trader.settings || {});
-        const batchSettings = batch.settings || {};
-        renderSettingsTable(document.getElementById("batch-settings-heatmap"), batchSettings.liquidation_heatmap_api || {});
-        renderSettingsTable(document.getElementById("batch-settings-hyperliquid"), batchSettings.hyperliquid_batch || {});
-      } catch (err) {
-        const errRow = `<tr><td class="muted" colspan="2">Error loading settings</td></tr>`;
-        renderSettingsMeta(document.getElementById("trader-settings-meta"), {});
-        renderSettingsMeta(document.getElementById("batch-settings-meta"), {});
-        const traderRoot = document.getElementById("trader-settings-body");
-        const batchHeatmapRoot = document.getElementById("batch-settings-heatmap");
-        const batchHlRoot = document.getElementById("batch-settings-hyperliquid");
-        if (traderRoot) traderRoot.innerHTML = errRow;
-        if (batchHeatmapRoot) batchHeatmapRoot.innerHTML = errRow;
-        if (batchHlRoot) batchHlRoot.innerHTML = errRow;
+      const list = actions && Array.isArray(actions) ? actions : [];
+      if (list.length === 0) {
+        root.textContent = "No actions yet. Actions appear when the trader opens, closes, or upgrades SL.";
+        root.classList.add("muted");
+        return;
       }
+      root.classList.remove("muted");
+      const parts = list.map(a => {
+        const ts = a.ts ? (a.ts.length >= 19 ? a.ts.slice(0, 19).replace("T", " ") : a.ts) : "—";
+        const msg = escapeHtml((a.msg || "").replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n"));
+        return `<div class="trader-actions-item">
+          <div class="trader-actions-header">${ts}</div>
+          <div class="trader-actions-body">${msg.replace(/\\n/g, "<br>")}</div>
+        </div>`;
+      });
+      root.innerHTML = parts.join("");
     };
 
-    function renderPnlChart(mainContainer, overviewWrap, trades) {
+    const renderDepositWithdrawalHistory = (root, list) => {
+      if (!root) return;
+      const items = list && Array.isArray(list) ? list : [];
+      if (items.length === 0) {
+        root.innerHTML = `<tr><td class="muted" colspan="4">No deposit/withdrawal history</td></tr>`;
+        return;
+      }
+      const rows = items.map(item => {
+        const type = (item.type || "transfer").toLowerCase();
+        const typeLabel = type === "deposit" ? "Deposit" : type === "withdrawal" ? "Withdrawal" : "Transfer";
+        const typeClass = type === "deposit" ? "value success" : type === "withdrawal" ? "value danger" : "muted";
+        const amount = item.amount_usd != null ? Number(item.amount_usd) : 0;
+        const amountStr = type === "withdrawal" ? "-$" + fmt(Math.abs(amount), 2) : "+$" + fmt(amount, 2);
+        const time = item.time ? fmtTime(item.time) : "—";
+        const hash = item.tx_hash || "";
+        const txShort = hash ? (hash.slice(0, 10) + "…") : "—";
+        const txLink = hash ? `https://hyperliquid.xyz/tx/${hash}` : "#";
+        const txCell = hash ? `<a href="${txLink}" target="_blank" rel="noopener noreferrer" class="muted" title="${escapeHtml(hash)}">${txShort}</a>` : "—";
+        return `<tr>
+          <td><span class="${typeClass}">${escapeHtml(typeLabel)}</span></td>
+          <td class="${typeClass}">${amountStr}</td>
+          <td class="muted">${time}</td>
+          <td>${txCell}</td>
+        </tr>`;
+      }).join("");
+      root.innerHTML = rows;
+    };
+
+    function renderPnlChart(mainContainer, overviewWrap, trades, options) {
+      options = options || {};
+      const showMarketCap = !!options.showMarketCap;
+      const marketCapData = options.marketCapData && Array.isArray(options.marketCapData) ? options.marketCapData : [];
+      const currentEquity = options.currentEquity != null ? Number(options.currentEquity) : null;
+      const compareStatsWrap = document.getElementById("pnl-chart-compare-stats");
+      const cmpPortRetEl = document.getElementById("cmp-portfolio-ret");
+      const cmpBtcRetEl = document.getElementById("cmp-btc-ret");
+      const cmpAlphaEl = document.getElementById("cmp-alpha-pp");
+      const cmpRelOutEl = document.getElementById("cmp-relative-out");
+      const cmpPeriodEl = document.getElementById("cmp-period-label");
       if (!mainContainer) return;
       const fmtChart = (v) => (v >= 0 ? "+" : "") + "$" + Number(v).toFixed(2);
       const fmtTooltipTime = (t) => t ? new Date(t).toLocaleString() : "—";
       const escapeTitle = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const fmtPct = (v) => (v == null || !isFinite(v)) ? "—" : ((v >= 0 ? "+" : "") + v.toFixed(2) + "%");
+      const setCmpValue = (el, val) => {
+        if (!el) return;
+        if (val == null || !isFinite(val)) {
+          el.textContent = "—";
+          el.className = "v";
+          return;
+        }
+        el.textContent = fmtPct(val);
+        el.className = "v " + (val >= 0 ? "success" : "danger");
+      };
+      const setCompareVisible = (on) => {
+        if (compareStatsWrap) compareStatsWrap.hidden = !on;
+        if (cmpPeriodEl) cmpPeriodEl.hidden = !on;
+      };
+      const mainRect = mainContainer.getBoundingClientRect();
+      const w = Math.max(520, Math.floor(mainRect.width || 520));
+      const h = Math.max(220, Math.floor(mainRect.height || 220));
+      const ovRect = overviewWrap ? overviewWrap.getBoundingClientRect() : null;
+      const ow = Math.max(520, Math.floor((ovRect && ovRect.width) || w));
+      const oh = Math.max(48, Math.floor((ovRect && ovRect.height) || 48));
       if (!trades || trades.length === 0) {
-        mainContainer.innerHTML = "<svg viewBox=\\"0 0 520 220\\" preserveAspectRatio=\\"xMidYMid meet\\" overflow=\\"hidden\\"><text x=\\"260\\" y=\\"110\\" class=\\"chart-label\\" text-anchor=\\"middle\\">No trade data</text></svg>";
+        mainContainer.innerHTML = "<svg viewBox=\\"0 0 " + w + " " + h + "\\" preserveAspectRatio=\\"none\\" overflow=\\"hidden\\"><text x=\\"" + Math.round(w / 2) + "\\" y=\\"" + Math.round(h / 2) + "\\" class=\\"chart-label\\" text-anchor=\\"middle\\">No trade data</text></svg>";
         if (overviewWrap) overviewWrap.style.display = "none";
+        setCompareVisible(false);
         return;
       }
       const chronological = trades.slice().reverse();
@@ -2198,13 +2616,31 @@ async def portfolio_dashboard():
       const useTimeAxis = validTs.length >= 2;
       const minT = useTimeAxis ? Math.min(...validTs) : 0;
       const maxT = useTimeAxis ? Math.max(...validTs) : 1;
+      const useIndexMode = showMarketCap && marketCapData.length > 0 && currentEquity != null && currentEquity > 0;
+      const startEquity = useIndexMode ? currentEquity - (cumulative[n - 1] || 0) : 0;
+      const portfolioIndex = useIndexMode && startEquity > 0 ? cumulative.map(c => (startEquity + c) / startEquity * 100) : [];
+      function interpolateMc(ts) {
+        if (!marketCapData.length) return null;
+        const arr = marketCapData;
+        if (ts <= arr[0][0]) return arr[0][1];
+        if (ts >= arr[arr.length - 1][0]) return arr[arr.length - 1][1];
+        for (let i = 0; i < arr.length - 1; i++) {
+          if (arr[i][0] <= ts && ts <= arr[i + 1][0]) {
+            const t0 = arr[i][0], t1 = arr[i + 1][0], v0 = arr[i][1], v1 = arr[i + 1][1];
+            return v0 + (v1 - v0) * (ts - t0) / (t1 - t0 || 1);
+          }
+        }
+        return null;
+      }
+      const mcAtStart = useIndexMode ? interpolateMc(minT) : null;
+      const marketCapIndex = useIndexMode && mcAtStart != null && mcAtStart > 0
+        ? timestamps.map(ts => { const v = interpolateMc(ts); return v != null ? v / mcAtStart * 100 : null; })
+        : [];
       if (window.__pnlChartDataLen !== n) window.__pnlChartRange = [0, 1];
       window.__pnlChartDataLen = n;
       let range = window.__pnlChartRange || [0, 1];
       range = [Math.max(0, range[0]), Math.min(1, range[1])];
       if (range[1] <= range[0]) range = [0, 1];
-      const ow = 520, oh = 48;
-
       function getStartEnd() {
         const startIdx = Math.floor(range[0] * (n - 1));
         const endIdx = Math.min(n - 1, Math.ceil(range[1] * (n - 1)));
@@ -2216,54 +2652,109 @@ async def portfolio_dashboard():
         const count = endIdx - startIdx + 1;
         const minT_win = useTimeAxis ? (timestamps[startIdx] ?? minT) : startIdx;
         const maxT_win = useTimeAxis ? (timestamps[endIdx] ?? maxT) : endIdx;
-        const padding = { top: 28, right: 24, bottom: 44, left: 58 };
-        const w = 520, h = 220;
+        const paddingRight = (useIndexMode ? 52 : 24);
+        const padding = { top: 28, right: paddingRight, bottom: 44, left: 58 };
         const chartW = w - padding.left - padding.right;
         const chartH = h - padding.top - padding.bottom;
-        const minY = Math.min(0, ...cumulative);
-        const maxY = Math.max(0, ...cumulative);
-        const rangeY = maxY - minY || 1;
-        const scaleY = (v) => padding.top + chartH - ((v - minY) / rangeY) * chartH;
+        let minY, maxY, rangeY, scaleY, zeroY, yTicks, gridLines, yLabels, segmentPaths, segmentAreas, zeroLine, title, summary;
+        if (useIndexMode) {
+          const portIdxInWin = portfolioIndex.slice(startIdx, endIdx + 1).filter(x => x != null);
+          const mcIdxInWin = marketCapIndex.slice(startIdx, endIdx + 1).filter(x => x != null);
+          const allIdx = [...portIdxInWin, ...mcIdxInWin];
+          minY = allIdx.length ? Math.min(90, ...allIdx) : 90;
+          maxY = allIdx.length ? Math.max(110, ...allIdx) : 110;
+          rangeY = maxY - minY || 1;
+          scaleY = (v) => padding.top + chartH - ((v - minY) / rangeY) * chartH;
+          zeroY = scaleY(100);
+          yTicks = [];
+          for (let i = 0; i <= 4; i++) yTicks.push(minY + (rangeY / 4) * i);
+          gridLines = yTicks.map((val) => "<line x1=\\"" + padding.left + "\\" y1=\\"" + scaleY(val) + "\\" x2=\\"" + (w - padding.right) + "\\" y2=\\"" + scaleY(val) + "\\" class=\\"chart-grid\\"/>").join("");
+          yLabels = yTicks.map((val) => "<text x=\\"" + (padding.left - 6) + "\\" y=\\"" + (scaleY(val) + 3) + "\\" class=\\"chart-tick\\" text-anchor=\\"end\\">" + val.toFixed(0) + "</text>").join("");
+          segmentPaths = "";
+          segmentAreas = "";
+          for (let i = startIdx; i < endIdx; i++) {
+            const pi0 = portfolioIndex[i], pi1 = portfolioIndex[i + 1];
+            if (pi0 == null || pi1 == null) continue;
+            const x0 = useTimeAxis ? padding.left + ((timestamps[i] - minT_win) / (maxT_win - minT_win || 1)) * chartW : padding.left + ((i - startIdx) / Math.max(1, count - 1)) * chartW;
+            const x1 = useTimeAxis ? padding.left + ((timestamps[i + 1] - minT_win) / (maxT_win - minT_win || 1)) * chartW : padding.left + ((i + 1 - startIdx) / Math.max(1, count - 1)) * chartW;
+            const y0 = scaleY(pi0), y1 = scaleY(pi1);
+            segmentPaths += "<path d=\\"M " + x0 + "," + y0 + " L " + x1 + "," + y1 + "\\" class=\\"chart-line positive\\" stroke=\\"var(--accent)\\" stroke-width=\\"2\\"/>";
+          }
+          zeroLine = "<line x1=\\"" + padding.left + "\\" y1=\\"" + zeroY + "\\" x2=\\"" + (w - padding.right) + "\\" y2=\\"" + zeroY + "\\" stroke=\\"var(--muted)\\" stroke-width=\\"0.8\\" stroke-dasharray=\\"4\\"/>";
+          const lastPortIdx = portfolioIndex[endIdx];
+          const lastMcIdx = marketCapIndex[endIdx];
+          summary = "<text x=\\"" + (w - padding.right) + "\\" y=\\"" + (padding.top - 6) + "\\" class=\\"chart-tick\\" text-anchor=\\"end\\">Portfolio: " + (lastPortIdx != null ? lastPortIdx.toFixed(1) : "—") + " | BTC: " + (lastMcIdx != null ? lastMcIdx.toFixed(1) : "—") + "</text>";
+          title = "<text x=\\"" + padding.left + "\\" y=\\"" + (padding.top - 6) + "\\" class=\\"chart-label\\">Index (100 = start)</text>";
+        } else {
+          minY = Math.min(0, ...cumulative);
+          maxY = Math.max(0, ...cumulative);
+          rangeY = maxY - minY || 1;
+          scaleY = (v) => padding.top + chartH - ((v - minY) / rangeY) * chartH;
+          const scaleX_win = useTimeAxis
+            ? (ts) => padding.left + ((ts - minT_win) / (maxT_win - minT_win || 1)) * chartW
+            : (i) => padding.left + ((i - startIdx) / Math.max(1, count - 1)) * chartW;
+          const xAt = (i) => useTimeAxis ? scaleX_win(timestamps[i] ?? minT_win) : scaleX_win(i);
+          zeroY = scaleY(0);
+          yTicks = [];
+          const step = rangeY / 4;
+          for (let i = 0; i <= 4; i++) yTicks.push(minY + step * i);
+          gridLines = yTicks.map((val) => "<line x1=\\"" + padding.left + "\\" y1=\\"" + scaleY(val) + "\\" x2=\\"" + (w - padding.right) + "\\" y2=\\"" + scaleY(val) + "\\" class=\\"chart-grid\\"/>").join("");
+          yLabels = yTicks.map((val) => "<text x=\\"" + (padding.left - 6) + "\\" y=\\"" + (scaleY(val) + 3) + "\\" class=\\"chart-tick\\" text-anchor=\\"end\\">" + fmtChart(val) + "</text>").join("");
+          segmentPaths = "";
+          segmentAreas = "";
+          for (let i = startIdx; i < endIdx; i++) {
+            const trade = chronological[i + 1];
+            const pnl = Number(trade && trade.pnl_usd) || 0;
+            const legPositive = pnl >= 0;
+            const lineClass = "chart-line " + (legPositive ? "positive" : "negative");
+            const areaClass = "chart-area " + (legPositive ? "positive" : "negative");
+            const x0 = xAt(i), y0 = scaleY(cumulative[i]);
+            const x1 = xAt(i + 1), y1 = scaleY(cumulative[i + 1]);
+            segmentPaths += "<path d=\\"M " + x0 + "," + y0 + " L " + x1 + "," + y1 + "\\" class=\\"" + lineClass + "\\"/>";
+            segmentAreas += "<path d=\\"M " + x0 + "," + zeroY + " L " + x0 + "," + y0 + " L " + x1 + "," + y1 + " L " + x1 + "," + zeroY + " Z\\" class=\\"" + areaClass + "\\"/>";
+          }
+          zeroLine = "<line x1=\\"" + padding.left + "\\" y1=\\"" + zeroY + "\\" x2=\\"" + (w - padding.right) + "\\" y2=\\"" + zeroY + "\\" stroke=\\"var(--muted)\\" stroke-width=\\"0.8\\" stroke-dasharray=\\"4\\"/>";
+          const lastVal = cumulative[endIdx];
+          summary = "<text x=\\"" + (w - padding.right) + "\\" y=\\"" + (padding.top - 6) + "\\" class=\\"chart-tick\\" text-anchor=\\"end\\">Total: " + fmtChart(lastVal) + " (" + count + " trade" + (count !== 1 ? "s" : "") + ")</text>";
+          title = "<text x=\\"" + padding.left + "\\" y=\\"" + (padding.top - 6) + "\\" class=\\"chart-label\\">Cumulative PnL ($)</text>";
+        }
         const scaleX_win = useTimeAxis
           ? (ts) => padding.left + ((ts - minT_win) / (maxT_win - minT_win || 1)) * chartW
           : (i) => padding.left + ((i - startIdx) / Math.max(1, count - 1)) * chartW;
         const xAt = (i) => useTimeAxis ? scaleX_win(timestamps[i] ?? minT_win) : scaleX_win(i);
-        const zeroY = scaleY(0);
-        const yTicks = [];
-        const step = rangeY / 4;
-        for (let i = 0; i <= 4; i++) yTicks.push(minY + step * i);
-        const gridLines = yTicks.map((val) => "<line x1=\\"" + padding.left + "\\" y1=\\"" + scaleY(val) + "\\" x2=\\"" + (w - padding.right) + "\\" y2=\\"" + scaleY(val) + "\\" class=\\"chart-grid\\"/>").join("");
-        const yLabels = yTicks.map((val) => "<text x=\\"" + (padding.left - 6) + "\\" y=\\"" + (scaleY(val) + 3) + "\\" class=\\"chart-tick\\" text-anchor=\\"end\\">" + fmtChart(val) + "</text>").join("");
-        let segmentPaths = "", segmentAreas = "";
-        for (let i = startIdx; i < endIdx; i++) {
-          const trade = chronological[i + 1];
-          const pnl = Number(trade && trade.pnl_usd) || 0;
-          const legPositive = pnl >= 0;
-          const lineClass = "chart-line " + (legPositive ? "positive" : "negative");
-          const areaClass = "chart-area " + (legPositive ? "positive" : "negative");
-          const x0 = xAt(i), y0 = scaleY(cumulative[i]);
-          const x1 = xAt(i + 1), y1 = scaleY(cumulative[i + 1]);
-          segmentPaths += "<path d=\\"M " + x0 + "," + y0 + " L " + x1 + "," + y1 + "\\" class=\\"" + lineClass + "\\"/>";
-          segmentAreas += "<path d=\\"M " + x0 + "," + zeroY + " L " + x0 + "," + y0 + " L " + x1 + "," + y1 + " L " + x1 + "," + zeroY + " Z\\" class=\\"" + areaClass + "\\"/>";
+        let marketCapPath = "";
+        if (useIndexMode && marketCapIndex.some(x => x != null)) {
+          let d = "";
+          for (let i = startIdx; i <= endIdx; i++) {
+            const mc = marketCapIndex[i];
+            if (mc == null) continue;
+            const cx = xAt(i), cy = scaleY(mc);
+            d += (d ? " L " : "M ") + cx + "," + cy;
+          }
+          if (d) marketCapPath = "<path d=\\"" + d + "\\" fill=\\"none\\" stroke=\\"#a78bfa\\" stroke-width=\\"1.8\\" stroke-dasharray=\\"6 3\\"/><title>BTC (index)</title>";
         }
-        // Value labels on each point clutter the chart; rely on hover tooltips instead.
         const showValueLabels = false;
         const xStep = count > 20 ? Math.max(1, Math.floor(count / 14)) : 1;
         const dayKey = (t) => t && t.time ? (d => d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate())(new Date(t.time)) : "";
         const fmtXLabel = (trade) => !trade || !trade.time ? "" : (d => d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: d.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined }))(new Date(trade.time));
         let circles = "", valueLabels = "", xLabels = "", lastDayKey = "";
+        const yValForPoint = useIndexMode ? (i) => portfolioIndex[i] : (i) => cumulative[i];
         for (let i = startIdx; i <= endIdx; i++) {
           const trade = chronological[i];
           const pnl = Number(trade && trade.pnl_usd) || 0;
-          const y = cumulative[i];
-          const cx = xAt(i), cy = scaleY(y);
-          const col = pnl >= 0 ? "var(--success)" : "var(--danger)";
+          const y = yValForPoint(i);
+          if (y == null && useIndexMode) continue;
+          const cy = scaleY(y);
+          const cx = xAt(i);
+          const col = useIndexMode ? "var(--accent)" : (pnl >= 0 ? "var(--success)" : "var(--danger)");
           const r = count > 40 ? 2 : 3;
           const pnlPct = trade && trade.pnl_pct != null ? Number(trade.pnl_pct) : null;
           const pnlPctStr = pnlPct != null ? (pnlPct >= 0 ? "+" : "") + pnlPct.toFixed(2) + "%" : "—";
-          const tooltipLines = escapeTitle((trade && trade.symbol) || "—") + "\\nPnL: " + (pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(2) + "\\nPnL %: " + pnlPctStr + "\\nTime: " + escapeTitle(fmtTooltipTime(trade && trade.time));
+          const tooltipLines = useIndexMode
+            ? "Portfolio: " + (portfolioIndex[i] != null ? portfolioIndex[i].toFixed(1) : "—") + "\\nBTC: " + (marketCapIndex[i] != null ? marketCapIndex[i].toFixed(1) : "—") + "\\nTime: " + escapeTitle(fmtTooltipTime(trade && trade.time))
+            : escapeTitle((trade && trade.symbol) || "—") + "\\nPnL: " + (pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(2) + "\\nPnL %: " + pnlPctStr + "\\nTime: " + escapeTitle(fmtTooltipTime(trade && trade.time));
           circles += "<circle cx=\\"" + cx + "\\" cy=\\"" + cy + "\\" r=\\"" + r + "\\" fill=\\"" + col + "\\" stroke=\\"var(--panel)\\" stroke-width=\\"1.2\\"><title>" + tooltipLines + "</title></circle>";
-          if (showValueLabels) valueLabels += "<text x=\\"" + cx + "\\" y=\\"" + (cy + (y >= 0 ? -8 : 14)) + "\\" class=\\"chart-value\\" fill=\\"" + col + "\\" text-anchor=\\"middle\\">" + fmtChart(y) + "</text>";
+          if (showValueLabels) valueLabels += "<text x=\\"" + cx + "\\" y=\\"" + (cy + (y >= (useIndexMode ? 100 : 0) ? -8 : 14)) + "\\" class=\\"chart-value\\" fill=\\"" + col + "\\" text-anchor=\\"middle\\">" + (useIndexMode ? (y != null ? y.toFixed(1) : "") : fmtChart(y)) + "</text>";
           const dk = dayKey(trade);
           const isFirstOfDay = useTimeAxis && dk && dk !== lastDayKey;
           if (isFirstOfDay) lastDayKey = dk;
@@ -2273,11 +2764,42 @@ async def portfolio_dashboard():
             if (label) xLabels += "<text x=\\"" + cx + "\\" y=\\"" + (h - 10) + "\\" class=\\"chart-tick\\" text-anchor=\\"middle\\">" + escapeTitle(String(label)) + "</text>";
           }
         }
-        const zeroLine = "<line x1=\\"" + padding.left + "\\" y1=\\"" + zeroY + "\\" x2=\\"" + (w - padding.right) + "\\" y2=\\"" + zeroY + "\\" stroke=\\"var(--muted)\\" stroke-width=\\"0.8\\" stroke-dasharray=\\"4\\"/>";
-        const lastVal = cumulative[endIdx];
-        const summary = "<text x=\\"" + (w - padding.right) + "\\" y=\\"" + (padding.top - 6) + "\\" class=\\"chart-tick\\" text-anchor=\\"end\\">Total: " + fmtChart(lastVal) + " (" + count + " trade" + (count !== 1 ? "s" : "") + ")</text>";
-        const title = "<text x=\\"" + padding.left + "\\" y=\\"" + (padding.top - 6) + "\\" class=\\"chart-label\\">Cumulative PnL ($)</text>";
-        mainContainer.innerHTML = "<svg viewBox=\\"0 0 " + w + " " + h + "\\" preserveAspectRatio=\\"xMidYMid meet\\" overflow=\\"hidden\\">" + title + summary + gridLines + yLabels + segmentAreas + zeroLine + segmentPaths + circles + valueLabels + xLabels + "</svg>";
+        const legend = useIndexMode ? "<text x=\\"" + (padding.left + chartW / 2 - 60) + "\\" y=\\"" + (h - 2) + "\\" class=\\"chart-tick\\" font-size=\\"11\\"><tspan fill=\\"var(--accent)\\">●</tspan> Portfolio &nbsp; <tspan fill=\\"#a78bfa\\">- -</tspan> BTC</text>" : "";
+        mainContainer.innerHTML = "<svg viewBox=\\"0 0 " + w + " " + h + "\\" preserveAspectRatio=\\"none\\" overflow=\\"hidden\\">" + title + summary + gridLines + yLabels + segmentAreas + zeroLine + segmentPaths + marketCapPath + circles + valueLabels + xLabels + legend + "</svg>";
+
+        if (useIndexMode) {
+          let portStart = null, portEnd = null, btcStart = null, btcEnd = null;
+          for (let i = startIdx; i <= endIdx; i++) {
+            const pv = portfolioIndex[i];
+            const bv = marketCapIndex[i];
+            if (portStart == null && pv != null) portStart = pv;
+            if (btcStart == null && bv != null) btcStart = bv;
+          }
+          for (let i = endIdx; i >= startIdx; i--) {
+            const pv = portfolioIndex[i];
+            const bv = marketCapIndex[i];
+            if (portEnd == null && pv != null) portEnd = pv;
+            if (btcEnd == null && bv != null) btcEnd = bv;
+          }
+          const portRet = (portStart != null && portEnd != null && portStart > 0) ? ((portEnd / portStart) - 1) * 100 : null;
+          const btcRet = (btcStart != null && btcEnd != null && btcStart > 0) ? ((btcEnd / btcStart) - 1) * 100 : null;
+          const alphaPp = (portRet != null && btcRet != null) ? (portRet - btcRet) : null;
+          const relOut = (portRet != null && btcRet != null && (1 + btcRet / 100) > 0) ? (((1 + portRet / 100) / (1 + btcRet / 100)) - 1) * 100 : null;
+          setCmpValue(cmpPortRetEl, portRet);
+          setCmpValue(cmpBtcRetEl, btcRet);
+          setCmpValue(cmpAlphaEl, alphaPp);
+          setCmpValue(cmpRelOutEl, relOut);
+          if (cmpPeriodEl) {
+            const startTrade = chronological[startIdx];
+            const endTrade = chronological[endIdx];
+            const startLabel = startTrade && startTrade.time ? new Date(startTrade.time).toLocaleString() : "—";
+            const endLabel = endTrade && endTrade.time ? new Date(endTrade.time).toLocaleString() : "—";
+            cmpPeriodEl.textContent = "Window: " + startLabel + " -> " + endLabel;
+          }
+          setCompareVisible(true);
+        } else {
+          setCompareVisible(false);
+        }
       }
 
       const scaleXFull = (i) => (i / Math.max(1, n - 1)) * (ow - 4) + 2;
@@ -2346,6 +2868,33 @@ async def portfolio_dashboard():
     }
 
     let _dashboardRange = "all";
+    let _marketCapData = [];
+    let _lastChartTrades = [];
+    let _lastHl = {};
+    const MARKETCAP_STORAGE_KEY = "vantage2_show_marketcap";
+    function getShowMarketCap() {
+      try {
+        const c = document.getElementById("pnl-chart-show-marketcap");
+        if (c) return c.checked;
+        return localStorage.getItem(MARKETCAP_STORAGE_KEY) === "1";
+      } catch (e) { return false; }
+    }
+    function setShowMarketCap(on) {
+      try {
+        const c = document.getElementById("pnl-chart-show-marketcap");
+        if (c) c.checked = !!on;
+        localStorage.setItem(MARKETCAP_STORAGE_KEY, on ? "1" : "0");
+      } catch (e) {}
+    }
+    async function fetchMarketCapHistory() {
+      try {
+        const rangeParam = _dashboardRange === "all" ? "" : "&range=" + encodeURIComponent(_dashboardRange);
+        const res = await fetch("/portfolio?_t=" + Date.now() + rangeParam + "&include_market_cap=1&market_cap_days=365");
+        const data = await res.json();
+        if (data && data.ok && Array.isArray(data.market_cap)) _marketCapData = data.market_cap;
+        else _marketCapData = [];
+      } catch (e) { _marketCapData = []; }
+    }
     function setRangeButtons(activeRange) {
       document.querySelectorAll(".range-btn").forEach(btn => {
         btn.classList.toggle("active", (btn.getAttribute("data-range") || "") === activeRange);
@@ -2353,16 +2902,16 @@ async def portfolio_dashboard():
     }
     async function load() {
       const updatedEl = document.getElementById("updated");
-      const settingsPromise = fetchSettings();
       try {
         const rangeParam = _dashboardRange === "all" ? "" : "&range=" + encodeURIComponent(_dashboardRange);
         const res = await fetch("/portfolio?_t=" + Date.now() + rangeParam);
         if (!res.ok) {
           updatedEl.textContent = "Error: HTTP " + res.status + " — check server";
-          renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), []);
+          renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), [], {});
           renderCards(document.getElementById("hl-cards"), {});
           renderOverviewTable(document.getElementById("hl-overview"), null);
           renderPnlCalendar([]);
+          renderCalendarAvgDailyPnlPct([], _dashboardRange || "all");
           renderPerSymbolPnl(document.getElementById("per-symbol-pnl-body"), [], null);
           renderPositions(document.getElementById("hl-positions"), []);
           return;
@@ -2372,36 +2921,51 @@ async def portfolio_dashboard():
           data = await res.json();
         } catch (e) {
           updatedEl.textContent = "Error: invalid response (not JSON)";
-          renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), []);
+          renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), [], {});
           renderCards(document.getElementById("hl-cards"), {});
           renderOverviewTable(document.getElementById("hl-overview"), null);
           renderPerSymbolPnl(document.getElementById("per-symbol-pnl-body"), [], null);
           renderPositions(document.getElementById("hl-positions"), []);
+          renderLast10Closed(document.getElementById("hl-last-10-closed"), []);
+          renderTraderActions(document.getElementById("hl-trader-actions"), []);
+          renderDepositWithdrawalHistory(document.getElementById("hl-deposit-withdrawal-history"), []);
           return;
         }
         if (!data || !data.ok) {
           updatedEl.textContent = data && data.error ? ("Error: " + data.error) : "Error: no data (ok=false or empty)";
           const hl = (data && data.hyperliquid) || {};
           const chartTrades = (hl.all_trades && hl.all_trades.length) ? hl.all_trades : (hl.last_10_trades || []);
-          renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), chartTrades);
+          renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), chartTrades, { showMarketCap: getShowMarketCap(), marketCapData: _marketCapData, currentEquity: hl.equity });
           renderCards(document.getElementById("hl-cards"), hl);
           renderOverviewTable(document.getElementById("hl-overview"), hl.overview_breakdown || null);
           renderPnlCalendar(hl.daily_pnl || []);
+          renderCalendarAvgDailyPnlPct(hl.daily_pnl || [], hl.range || "all");
           if (hl.per_symbol_pnl && Array.isArray(hl.per_symbol_pnl)) {
             renderPerSymbolPnl(document.getElementById("per-symbol-pnl-body"), hl.per_symbol_pnl, hl.range);
             const t = document.getElementById("per-symbol-pnl-title"); if (t) t.textContent = hl.range && hl.range !== "all" ? "Per symbol PnL (" + hl.range + ")" : "Per symbol PnL";
           } else renderPerSymbolPnl(document.getElementById("per-symbol-pnl-body"), [], null);
           renderPositions(document.getElementById("hl-positions"), hl.open_positions || []);
+          renderLast10Closed(document.getElementById("hl-last-10-closed"), hl.last_10_trades || []);
+          renderTraderActions(document.getElementById("hl-trader-actions"), hl.trader_actions || []);
+          renderDepositWithdrawalHistory(document.getElementById("hl-deposit-withdrawal-history"), hl.deposit_withdrawal_history || []);
           return;
         }
         updatedEl.textContent = "Updated: " + new Date(data.t).toLocaleString();
         const hl = data.hyperliquid || {};
         const chartTrades = (hl.all_trades && hl.all_trades.length) ? hl.all_trades : (hl.last_10_trades || []);
-        renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), chartTrades);
+        _lastChartTrades = chartTrades;
+        _lastHl = hl;
+        const showMc = getShowMarketCap();
+        if (showMc && _marketCapData.length === 0) await fetchMarketCapHistory();
+        renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), chartTrades, { showMarketCap: showMc, marketCapData: _marketCapData, currentEquity: hl.equity });
         renderCards(document.getElementById("hl-cards"), hl);
         renderOverviewTable(document.getElementById("hl-overview"), hl.overview_breakdown || null);
         renderPnlCalendar(hl.daily_pnl || []);
+        renderCalendarAvgDailyPnlPct(hl.daily_pnl || [], hl.range || "all");
         renderPositions(document.getElementById("hl-positions"), hl.open_positions || []);
+        renderLast10Closed(document.getElementById("hl-last-10-closed"), hl.last_10_trades || []);
+        renderTraderActions(document.getElementById("hl-trader-actions"), hl.trader_actions || []);
+        renderDepositWithdrawalHistory(document.getElementById("hl-deposit-withdrawal-history"), hl.deposit_withdrawal_history || []);
         if (hl.per_symbol_pnl && Array.isArray(hl.per_symbol_pnl)) {
           renderPerSymbolPnl(document.getElementById("per-symbol-pnl-body"), hl.per_symbol_pnl, hl.range);
           const perSymbolTitle = document.getElementById("per-symbol-pnl-title");
@@ -2413,27 +2977,49 @@ async def portfolio_dashboard():
         _dashboardRange = hl.range || "all";
       } catch (err) {
         updatedEl.textContent = "Error: " + (err.message || "failed to load");
-        renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), []);
+        renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), [], {});
         renderCards(document.getElementById("hl-cards"), {});
         renderOverviewTable(document.getElementById("hl-overview"), null);
         renderPerSymbolPnl(document.getElementById("per-symbol-pnl-body"), [], null);
         renderPnlCalendar([]);
+        renderCalendarAvgDailyPnlPct([], _dashboardRange || "all");
         renderPositions(document.getElementById("hl-positions"), []);
+        renderLast10Closed(document.getElementById("hl-last-10-closed"), []);
+        renderTraderActions(document.getElementById("hl-trader-actions"), []);
+        renderDepositWithdrawalHistory(document.getElementById("hl-deposit-withdrawal-history"), []);
       } finally {
-        try { await settingsPromise; } catch (e) {}
       }
     }
 
     setRangeButtons("all");
     setupPerSymbolSort();
+    const savedShowMc = localStorage.getItem(MARKETCAP_STORAGE_KEY) === "1";
+    const chartCb = document.getElementById("pnl-chart-show-marketcap");
+    if (chartCb) chartCb.checked = savedShowMc;
     document.querySelectorAll(".range-btn").forEach(btn => {
       btn.addEventListener("click", () => {
         _dashboardRange = btn.getAttribute("data-range") || "all";
         load();
       });
     });
+    if (chartCb) {
+      chartCb.addEventListener("change", async () => {
+        setShowMarketCap(chartCb.checked);
+        if (chartCb.checked && _marketCapData.length === 0) await fetchMarketCapHistory();
+        renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), _lastChartTrades, { showMarketCap: chartCb.checked, marketCapData: _marketCapData, currentEquity: _lastHl && _lastHl.equity });
+      });
+    }
     load();
     setInterval(load, 60000);  // 60s — throttle to avoid flip; chart/metrics from file, only equity/positions refresh
+    setInterval(async () => {
+      const root = document.getElementById("hl-trader-actions");
+      if (!root) return;
+      try {
+        const res = await fetch("/trader-actions?_t=" + Date.now());
+        const data = await res.json();
+        if (data && data.ok && Array.isArray(data.actions)) renderTraderActions(root, data.actions);
+      } catch (e) {}
+    }, 30000);  // 30s — trader actions stream only
   </script>
 </body>
 </html>
@@ -2447,7 +3033,6 @@ async def root():
         "endpoints": {
             "/arthurvega/fundingOI": "Open Interest & Funding Rate data",
             "/portfolio": "Hyperliquid portfolio summary (JSON)",
-            "/portfolio-settings": "Dashboard settings snapshots (JSON)",
             "/portfolio-dashboard": "Portfolio dashboard (HTML)"
         },
         "description": "Modular API for trading data"
