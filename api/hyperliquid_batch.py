@@ -39,7 +39,6 @@ SYMBOL_TO_COIN: Dict[str, str] = {
     "LINKUSDT": "LINK",
     "XMRUSDT": "XMR",
     "ASTERUSDT": "ASTER",
-    "HYPEUSDT": "HYPE",
     "SUIUSDT": "SUI",
     "PUMPUSDT": "PUMP",
     # Tier 1 - High Liquidity, Major Coins

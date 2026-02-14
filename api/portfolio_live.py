@@ -142,6 +142,17 @@ def _hl_normalize_positions(state: Dict[str, Any]) -> List[Dict[str, Any]]:
             pass
         # Use symbol with USDT suffix for dashboard (matches trading pairs)
         symbol_display = f"{coin}USDT" if (isinstance(coin, str) and coin) else ""
+        # Live price and price difference from entry (for dashboard Open Positions)
+        mark_price = mark_prices.get(coin) if isinstance(mark_prices.get(coin), (int, float)) else None
+        price_diff = None
+        price_diff_pct = None
+        if mark_price and mark_price > 0 and entry and entry > 0:
+            if side == "LONG":
+                price_diff = round(mark_price - entry, 4)
+                price_diff_pct = round((mark_price - entry) / entry * 100, 2)
+            else:  # SHORT
+                price_diff = round(entry - mark_price, 4)
+                price_diff_pct = round((entry - mark_price) / entry * 100, 2)
         out.append({
             "symbol": symbol_display or coin,
             "side": side,
@@ -154,6 +165,9 @@ def _hl_normalize_positions(state: Dict[str, Any]) -> List[Dict[str, Any]]:
             "pnl_pct": pnl_pct,
             "pnl_usd": pnl_usd,
             "position_size_usd": position_size_usd,
+            "mark_price": mark_price,
+            "price_diff": price_diff,
+            "price_diff_pct": price_diff_pct,
         })
     return out
 
@@ -207,6 +221,45 @@ def _hl_is_close_fill(f: Dict[str, Any]) -> bool:
     """True if fill is a close (Close Long / Close Short), not an open."""
     dir_str = (f.get("dir") or "").strip() if isinstance(f.get("dir"), str) else ""
     return dir_str.startswith("Close ") or dir_str in ("Close Long", "Close Short")
+
+
+def _hl_is_open_fill(f: Dict[str, Any]) -> bool:
+    """True if fill is an open (Open Long / Open Short), not a close."""
+    dir_str = (f.get("dir") or "").strip() if isinstance(f.get("dir"), str) else ""
+    return dir_str.startswith("Open ") or dir_str in ("Open Long", "Open Short")
+
+
+def _hl_open_time_for_close_fill(fills: List[Dict[str, Any]], close_f: Dict[str, Any]) -> Optional[int]:
+    """Find the most recent open fill for the same coin/side before this close; return its time_ms or None."""
+    close_ts = close_f.get("time")
+    try:
+        close_ts = int(close_ts)
+    except (TypeError, ValueError):
+        return None
+    coin = close_f.get("coin", "")
+    dir_str = (close_f.get("dir") or "").strip().lower()
+    is_long_close = "long" in dir_str or dir_str == "l"
+    # Match open: same coin, Open Long before Close Long, Open Short before Close Short
+    best_open_ts = None
+    for f in fills:
+        if not isinstance(f, dict) or f.get("coin") != coin:
+            continue
+        fdir = (f.get("dir") or "").strip().lower()
+        if is_long_close and ("long" in fdir or fdir == "l") and _hl_is_open_fill(f):
+            try:
+                t = int(f.get("time", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if t < close_ts and (best_open_ts is None or t > best_open_ts):
+                best_open_ts = t
+        elif not is_long_close and ("short" in fdir or fdir == "s") and _hl_is_open_fill(f):
+            try:
+                t = int(f.get("time", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if t < close_ts and (best_open_ts is None or t > best_open_ts):
+                best_open_ts = t
+    return best_open_ts
 
 
 def _hl_net_pnl_from_fill(f: Dict[str, Any]) -> Optional[float]:
@@ -300,6 +353,15 @@ def _hl_last_10_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str,
         dir_str = (f.get("dir") or "").strip()
         dir_lower = dir_str.lower()
         side = "LONG" if "long" in dir_lower or dir_str == "L" else "SHORT" if "short" in dir_lower or dir_str == "S" else None
+        open_ts = _hl_open_time_for_close_fill(fills, f)
+        opened_at_iso = None
+        duration_seconds = None
+        if open_ts is not None and open_ts < t:
+            try:
+                opened_at_iso = datetime.utcfromtimestamp(open_ts / 1000.0).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                duration_seconds = max(0, int(round((t - open_ts) / 1000.0)))
+            except Exception:
+                pass
         closed.append({
             "symbol": coin,
             "pnl_usd": round(pnl, 2),
@@ -310,6 +372,8 @@ def _hl_last_10_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str,
             "side": side,
             "exit_type": "TAKE_PROFIT" if pnl > 0 else "STOP_LOSS",
             "time": f"{t}",
+            "opened_at": opened_at_iso,
+            "duration_seconds": duration_seconds,
         })
     # Sort by time descending (most recent first), take 10
     closed.sort(key=lambda x: int(x["time"]), reverse=True)
@@ -371,6 +435,15 @@ def _hl_all_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str, Any
         dir_str = (f.get("dir") or "").strip()
         dir_lower = dir_str.lower()
         side = "LONG" if "long" in dir_lower or dir_str == "L" else "SHORT" if "short" in dir_lower or dir_str == "S" else None
+        open_ts = _hl_open_time_for_close_fill(fills, f)
+        opened_at_iso = None
+        duration_seconds = None
+        if open_ts is not None and open_ts < t:
+            try:
+                opened_at_iso = datetime.utcfromtimestamp(open_ts / 1000.0).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                duration_seconds = max(0, int(round((t - open_ts) / 1000.0)))
+            except Exception:
+                pass
         closed.append({
             "symbol": coin,
             "pnl_usd": round(pnl, 2),
@@ -381,6 +454,8 @@ def _hl_all_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str, Any
             "side": side,
             "exit_type": "TAKE_PROFIT" if pnl > 0 else "STOP_LOSS",
             "time": f"{t}",
+            "opened_at": opened_at_iso,
+            "duration_seconds": duration_seconds,
         })
     closed.sort(key=lambda x: int(x["time"]), reverse=True)
     for t in closed:
@@ -390,6 +465,53 @@ def _hl_all_trades_from_fills(fills: List[Dict[str, Any]]) -> List[Dict[str, Any
         except Exception:
             pass
     return closed
+
+
+def _hl_deposit_withdrawal_history(user: str) -> Optional[List[Dict[str, Any]]]:
+    """Fetch user non-funding ledger updates (deposits, withdrawals, transfers). Returns list of { type, amount_usd, time_iso, tx_hash }."""
+    payload = {"type": "userNonFundingLedgerUpdates", "user": user.lower()}
+    if HL_DEX:
+        payload["dex"] = HL_DEX
+    data = _hl_post(payload, timeout=HL_REQUEST_TIMEOUT)
+    if not isinstance(data, list):
+        return None
+    out = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        delta = entry.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        try:
+            ts_ms = entry.get("time")
+            time_iso = datetime.utcfromtimestamp(int(ts_ms) / 1000.0).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z" if ts_ms else None
+        except (TypeError, ValueError, OSError):
+            time_iso = None
+        tx_hash = entry.get("hash")
+        uid = (delta.get("user") or "").strip().lower()
+        dest = (delta.get("destination") or "").strip().lower()
+        our = user.strip().lower()
+        amount_str = delta.get("usdcValue") or delta.get("amount") or "0"
+        try:
+            amount_usd = round(float(amount_str), 2)
+        except (TypeError, ValueError):
+            amount_usd = 0.0
+        if uid == our and dest != our:
+            kind = "withdrawal"
+        elif dest == our and uid != our:
+            kind = "deposit"
+        else:
+            kind = "transfer"
+        out.append({
+            "type": kind,
+            "amount_usd": amount_usd,
+            "time": time_iso,
+            "tx_hash": tx_hash,
+            "token": delta.get("token") or "USDC",
+        })
+    # Sort by time descending (most recent first)
+    out.sort(key=lambda x: (x.get("time") or ""), reverse=True)
+    return out[:100]  # Last 100 entries
 
 
 def fetch_live_hyperliquid() -> Optional[Dict[str, Any]]:
@@ -428,6 +550,11 @@ def fetch_live_hyperliquid() -> Optional[Dict[str, Any]]:
             "open_positions": positions,
             "open_positions_count": len(positions),
         }
+        # Deposit/withdrawal history (non-funding ledger updates)
+        ledger = _hl_deposit_withdrawal_history(user)
+        if ledger:
+            out["deposit_withdrawal_history"] = ledger
+
         # Live win rate + last 10 trades + full history from exchange fills
         fills = _hl_user_fills()
         if fills:
