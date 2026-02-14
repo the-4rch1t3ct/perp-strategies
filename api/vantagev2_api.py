@@ -142,6 +142,8 @@ DASHBOARD_DAILY_EQUITY_PATH = CLAWD_MEMORY_DIR / "dashboard_daily_equity.json"
 DASHBOARD_DAILY_EQUITY_MAX = 370  # ~1 year of daily snapshots
 # After reset: only show trades that closed on or after this time (ISO ts). Set by reset_dashboard_data.sh.
 DASHBOARD_PERFORMANCE_SINCE_PATH = CLAWD_MEMORY_DIR / "dashboard_performance_since.json"
+# Side circuit breaker state file (read-only from dashboard)
+SIDE_CB_STATE_PATH = CLAWD_MEMORY_DIR / "side_cb_state.json"
 
 # Optional live fetch for positions/equity (set env for HL to enable)
 try:
@@ -153,8 +155,9 @@ except ImportError:
         fetch_live_hyperliquid = None
 
 # Cache live HL data to avoid 429 and dashboard "flip" (alternating file vs API dataset)
+# HL limit 1200 weight/min; portfolio fetch ~5-6 requests (~10-60 weight). 15s = 4/min, safe.
 _live_hl_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
-LIVE_HL_CACHE_TTL = 60.0  # seconds — refresh at most once per minute; metrics/chart stay file-based
+LIVE_HL_CACHE_TTL = 15.0  # seconds — 4 refreshes/min, well under HL rate limit
 DASHBOARD_TRADES_SOURCE = os.getenv("DASHBOARD_TRADES_SOURCE", "live").strip().lower()  # "live" or "file"
 
 
@@ -1490,9 +1493,24 @@ async def get_portfolio_dashboard(
     range_filter: Optional[str] = Query(None, alias="range"),
     include_market_cap: bool = Query(False, alias="include_market_cap"),
     market_cap_days: int = Query(365, ge=7, le=365),
+    actions_only: bool = Query(False, alias="actions_only"),
+    actions_limit: int = Query(TRADER_ACTIONS_LIMIT, ge=1, le=500, alias="actions_limit"),
+    candles_coin: Optional[str] = Query(None, alias="candles_coin"),
+    candles_interval: str = Query("15m", alias="candles_interval"),
+    candles_limit: int = Query(96, ge=12, le=500, alias="candles_limit"),
 ):
     """Hyperliquid portfolio summary for dashboard. Uses live positions/equity when env is set. Query param range=24h|7d|30d|all filters overview and per-symbol PnL to that window."""
     try:
+        # Compatibility mode for strict nginx setups that proxy only exact /portfolio.
+        # This lets frontend fetch lightweight trader-actions and symbol candles via query params.
+        if candles_coin:
+            return await _get_symbol_candles_impl(candles_coin, candles_interval, candles_limit)
+        if actions_only:
+            return JSONResponse(
+                {"ok": True, "actions": _load_trader_actions(limit=actions_limit)},
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
+
         hl_perf = _load_json(HL_PERF_PATH)
         hl_pos = _load_json(HL_POS_PATH)
         since_dt = _get_performance_since()
@@ -1524,6 +1542,9 @@ async def get_portfolio_dashboard(
                         import traceback
                         print(f"⚠️  Live Hyperliquid fetch failed: {e}", flush=True)
                         traceback.print_exc()
+                # Avoid flip: if fetch returned None (e.g. 429), keep showing last good live cache
+                if live_hl is None and _live_hl_cache["data"] is not None:
+                    live_hl = _live_hl_cache["data"]
             if live_hl:
                 # Merge live trades; respect dashboard_performance_since.json when set (fresh restart).
                 hl_summary = _merge_live_into_summary(
@@ -1532,6 +1553,16 @@ async def get_portfolio_dashboard(
                     merge_trades_and_stats=use_live_trades,
                     filter_since=True,
                 )
+                # Enrich live positions with TP/SL from positions file (HL API does not return them)
+                for pos in (hl_summary.get("open_positions") or []):
+                    sym = (pos.get("symbol") or "").strip()
+                    coin = sym.replace("USDT", "").replace("USD", "").replace("-PERP", "").strip() or sym
+                    file_pos = hl_pos.get(coin) if isinstance(hl_pos, dict) else None
+                    if isinstance(file_pos, dict):
+                        if file_pos.get("tp_price") is not None:
+                            pos["tp_price"] = file_pos["tp_price"]
+                        if file_pos.get("sl_price") is not None:
+                            pos["sl_price"] = file_pos["sl_price"]
         # Align total PnL% to equity (clearer than ROE on margin)
         hl_summary = _apply_equity_based_pnl_pct(hl_summary)
 
@@ -1634,10 +1665,31 @@ async def get_portfolio_dashboard(
                 total_bucket["max_drawdown_pct"] = None  # range-specific drawdown not computed
             hl_summary = _apply_equity_based_pnl_pct(hl_summary)
 
+        # Load side circuit breaker status for dashboard
+        side_cb_status = None
+        try:
+            if SIDE_CB_STATE_PATH.exists():
+                with open(SIDE_CB_STATE_PATH, 'r') as _scbf:
+                    _scb_data = json.load(_scbf)
+                now_ts = time.time()
+                side_cb_status = {
+                    "long_blocked": _scb_data.get("blocked_until", {}).get("LONG", 0) > now_ts,
+                    "short_blocked": _scb_data.get("blocked_until", {}).get("SHORT", 0) > now_ts,
+                    "long_remaining_h": max(0, (_scb_data.get("blocked_until", {}).get("LONG", 0) - now_ts) / 3600),
+                    "short_remaining_h": max(0, (_scb_data.get("blocked_until", {}).get("SHORT", 0) - now_ts) / 3600),
+                    "risk_off": _scb_data.get("risk_off_until", 0) > now_ts,
+                    "risk_off_remaining_h": max(0, (_scb_data.get("risk_off_until", 0) - now_ts) / 3600),
+                    "long_streak": _scb_data.get("streak", {}).get("LONG", 0),
+                    "short_streak": _scb_data.get("streak", {}).get("SHORT", 0),
+                }
+        except Exception:
+            pass
+
         response_payload = {
             "ok": True,
             "t": datetime.now().isoformat(),
             "hyperliquid": hl_summary,
+            "side_cb": side_cb_status,
         }
         if include_market_cap:
             now = time.time()
@@ -1645,10 +1697,18 @@ async def get_portfolio_dashboard(
             if _market_cap_cache["data"] is not None and (now - _market_cap_cache["ts"]) < _MARKET_CAP_CACHE_TTL_SEC:
                 market_series = _market_cap_cache["data"]
             else:
-                market_series = await asyncio.to_thread(_fetch_btc_daily_candles, market_cap_days)
-                if market_series is not None:
-                    _market_cap_cache["data"] = market_series
-                    _market_cap_cache["ts"] = now
+                try:
+                    market_series = await asyncio.wait_for(
+                        asyncio.to_thread(_fetch_btc_daily_candles, market_cap_days),
+                        timeout=15.0,
+                    )
+                    if market_series is not None:
+                        _market_cap_cache["data"] = market_series
+                        _market_cap_cache["ts"] = now
+                except asyncio.TimeoutError:
+                    market_series = _market_cap_cache["data"]
+                except Exception:
+                    market_series = _market_cap_cache["data"]
             response_payload["market_cap"] = market_series if market_series else []
         return JSONResponse(
             response_payload,
@@ -1757,6 +1817,101 @@ def _fetch_btc_daily_candles(days: int = 365) -> Optional[List[List[float]]]:
     return series if series else None
 
 
+def _fetch_symbol_candles(coin: str, interval: str = "15m", limit: int = 96) -> Optional[List[Dict[str, Any]]]:
+    """Fetch OHLC candles from Hyperliquid for a symbol. Returns [{"t": ms, "o", "h", "l", "c"}, ...] or None."""
+    import urllib.request
+    end_ms = int(time.time() * 1000)
+    ms_per = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "1d": 86_400_000}.get(interval, 900_000)
+    start_ms = end_ms - limit * ms_per
+    payload = json.dumps({
+        "type": "candleSnapshot",
+        "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms},
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            "https://api.hyperliquid.xyz/info",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            candles = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    if not candles or not isinstance(candles, list):
+        return None
+    out = []
+    for c in candles:
+        try:
+            out.append({
+                "t": int(c.get("t", 0)),
+                "o": float(c.get("o", 0)),
+                "h": float(c.get("h", 0)),
+                "l": float(c.get("l", 0)),
+                "c": float(c.get("c", 0)),
+            })
+        except (TypeError, ValueError):
+            continue
+    out.sort(key=lambda x: x["t"])
+    return out[-limit:] if len(out) > limit else out
+
+
+def _fetch_symbol_candles_binance(coin: str, interval: str = "15m", limit: int = 96) -> Optional[List[Dict[str, Any]]]:
+    """Fallback: fetch OHLC from Binance public API (no key). Symbol = coin+USDT."""
+    interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "1d": "1d"}
+    binance_interval = interval_map.get(interval, "15m")
+    symbol = (coin.strip().upper() + "USDT") if coin else ""
+    if not symbol:
+        return None
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={binance_interval}&limit={limit}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    if not rows or not isinstance(rows, list):
+        return None
+    out = []
+    for r in rows:
+        try:
+            if len(r) >= 5:
+                out.append({
+                    "t": int(r[0]),
+                    "o": float(r[1]),
+                    "h": float(r[2]),
+                    "l": float(r[3]),
+                    "c": float(r[4]),
+                })
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out[-limit:] if len(out) > limit else out
+
+
+async def _get_symbol_candles_impl(
+    coin: str, interval: str = "15m", limit: int = 96
+) -> JSONResponse:
+    """Shared impl: try Hyperliquid first, fallback to Binance if HL fails or returns empty."""
+    coin_upper = coin.strip().upper()
+    candles = await asyncio.to_thread(_fetch_symbol_candles, coin_upper, interval, limit)
+    if not candles and coin_upper:
+        candles = await asyncio.to_thread(_fetch_symbol_candles_binance, coin_upper, interval, limit)
+    return JSONResponse(
+        {"ok": candles is not None, "candles": candles or []},
+        headers={"Cache-Control": "public, max-age=60"},
+    )
+
+
+@app.get("/symbol-candles")
+@app.get("/portfolio/symbol-candles")
+async def get_symbol_candles(
+    coin: str = Query(..., description="Coin symbol e.g. BTC"),
+    interval: str = Query("15m", description="1m, 5m, 15m, 1h, 1d"),
+    limit: int = Query(96, ge=12, le=500),
+):
+    """Return OHLC candles for a symbol (for position chart modal). Source: Hyperliquid. Available at /symbol-candles and /portfolio/symbol-candles."""
+    return await _get_symbol_candles_impl(coin, interval, limit)
+
+
 @app.get("/market-cap-history")
 async def get_market_cap_history(days: int = Query(365, ge=7, le=365)):
     """Return BTC daily prices as crypto market proxy for dashboard overlay. Cached 1 hour. Source: Hyperliquid."""
@@ -1783,6 +1938,7 @@ async def portfolio_dashboard():
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Portfolio Dashboard - Hyperliquid</title>
+  <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
   <style>
     :root {
       --bg: #0b1220;
@@ -1917,7 +2073,7 @@ async def portfolio_dashboard():
 <body>
   <header>
     <h1>Portfolio Dashboard</h1>
-    <div class="time" id="updated">Loading…</div>
+    <div class="time" id="updated-wrap"><span id="updated">Loading…</span> <span id="retry-span" style="display:none"> <a href="#" id="retry-link" style="color:var(--accent)">Retry</a></span></div>
   </header>
   <div class="container">
     <div class="panel chart-panel">
@@ -1996,12 +2152,13 @@ async def portfolio_dashboard():
         <p class="muted" style="margin:0 0 8px 0; font-size:0.9em;">Live stream of actions the trader takes (opens, closes, SL upgrades) — same messages sent to Telegram.</p>
         <div id="hl-trader-actions" style="max-height:280px; overflow-y:auto; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-word; padding:8px; background:rgba(0,0,0,0.2); border-radius:8px;"></div>
       </div>
+      <div id="side-cb-banner" style="display:none; margin:10px 0; padding:10px 14px; border-radius:8px; background:rgba(255,180,0,0.12); border:1px solid rgba(255,180,0,0.3); font-size:13px; font-family:monospace;"></div>
       <div class="section-title">Open Positions (Live)</div>
       <div class="panel" style="margin-top:10px; max-height:320px; overflow-y:auto;">
         <table>
           <thead>
             <tr>
-              <th>Symbol</th><th>Side</th><th>Entry</th><th>Size ($)</th><th>PnL ($)</th><th>PnL %</th><th>Qty</th><th>Lev</th><th>Duration</th>
+              <th>Symbol</th><th>Side</th><th>Qty</th><th>Lev</th><th>Duration</th><th>Entry</th><th>Live</th><th>Δ</th><th>Size ($)</th><th>PnL ($)</th><th>PnL %</th>
             </tr>
           </thead>
           <tbody id="hl-positions"></tbody>
@@ -2051,6 +2208,20 @@ async def portfolio_dashboard():
           <a href="https://app.hyperliquid.xyz/withdraw" target="_blank" rel="noopener noreferrer" style="display:inline-flex; align-items:center; gap:8px; padding:8px 12px; text-decoration:none; color:var(--accent); border:1px solid rgba(255,255,255,0.14); border-radius:8px; font-size:0.9em;">Withdraw →</a>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div id="symbol-chart-modal" style="display:none; position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,0.7); align-items:center; justify-content:center; padding:20px;">
+    <div style="background:var(--panel); border-radius:12px; max-width:900px; width:100%; max-height:90vh; overflow:hidden; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,0.4);">
+      <div style="display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid #1f2a3c;">
+        <span id="symbol-chart-title" style="font-weight:600;">—</span>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <a id="symbol-chart-hl-link" href="#" target="_blank" rel="noopener noreferrer" style="font-size:12px; color:var(--accent);">Open on Hyperliquid</a>
+          <button type="button" id="symbol-chart-close" style="padding:6px 12px; background:#1f2a3c; border:none; border-radius:6px; color:var(--text); cursor:pointer; font-size:12px;">Close</button>
+        </div>
+      </div>
+      <div id="symbol-chart-container" style="width:100%; height:400px; min-height:300px;"></div>
+      <div id="symbol-chart-legend" style="padding:8px 16px; font-size:12px; color:var(--muted); border-top:1px solid #1f2a3c;"></div>
     </div>
   </div>
 
@@ -2399,7 +2570,7 @@ async def portfolio_dashboard():
     const renderPositions = (root, positions) => {
       if (!root) return;
       if (!positions || positions.length === 0) {
-        root.innerHTML = `<tr><td class="muted" colspan="9">No open positions</td></tr>`;
+        root.innerHTML = `<tr><td class="muted" colspan="11">No open positions</td></tr>`;
         return;
       }
       let totalSize = 0;
@@ -2431,17 +2602,27 @@ async def portfolio_dashboard():
             return d + "d " + h + "h";
           } catch (e) { return "—"; }
         })();
+        const livePriceDisplay = (p.mark_price != null && p.mark_price > 0) ? "$" + fmt(p.mark_price, 4) : "—";
+        const priceDiffPct = p.price_diff_pct != null ? Number(p.price_diff_pct) : null;
+        const priceDiffClass = priceDiffPct != null ? (priceDiffPct >= 0 ? "value success" : "value danger") : "";
+        const priceDiffDisplay = priceDiffPct != null ? (priceDiffPct >= 0 ? "+" : "") + fmt(priceDiffPct, 2) + "%" : "—";
+        const hasTpSl = (p.tp_price != null && Number(p.tp_price) > 0) || (p.sl_price != null && Number(p.sl_price) > 0);
+        const symCell = hasTpSl
+          ? `<td><button type="button" class="symbol-chart-btn" data-symbol="${escapeHtml(p.symbol || "")}" data-coin="${escapeHtml((p.symbol || "").replace(/USDT$/i,"").trim() || p.symbol || "")}" data-entry="${p.entry_price != null ? p.entry_price : ""}" data-tp="${p.tp_price != null ? p.tp_price : ""}" data-sl="${p.sl_price != null ? p.sl_price : ""}" style="background:none;border:none;color:var(--accent);cursor:pointer;text-decoration:underline;font-size:inherit;padding:0;">${escapeHtml(p.symbol || "—")}</button></td>`
+          : `<td><a href="https://app.hyperliquid.xyz/trade/${escapeHtml((p.symbol || "").replace(/USDT$/i,"").trim() || "BTC")}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);text-decoration:underline;">${escapeHtml(p.symbol || "—")}</a></td>`;
         return `
         <tr>
-          <td>${p.symbol}</td>
+          ${symCell}
           <td><span class="pill ${String(p.side).toLowerCase().includes('short') ? 'short' : 'long'}">${p.side ?? "—"}</span></td>
-          <td>${p.entry_price != null ? "$" + fmt(p.entry_price, 4) : "—"}</td>
-          <td>${sizeUsd}</td>
-          <td class="${pnlClass}">${pnlUsdDisplay}</td>
-          <td class="${pnlClass}">${pnlPctDisplay}</td>
           <td>${fmt(p.entry_qty, 4)}</td>
           <td>${fmt(p.leverage, 1)}x</td>
           <td>${durationDisplay}</td>
+          <td>${p.entry_price != null ? "$" + fmt(p.entry_price, 4) : "—"}</td>
+          <td>${livePriceDisplay}</td>
+          <td class="${priceDiffClass}">${priceDiffDisplay}</td>
+          <td>${sizeUsd}</td>
+          <td class="${pnlClass}">${pnlUsdDisplay}</td>
+          <td class="${pnlClass}">${pnlPctDisplay}</td>
         </tr>
       `;
       }).join("");
@@ -2454,14 +2635,137 @@ async def portfolio_dashboard():
           <td>Total</td>
           <td></td>
           <td></td>
+          <td></td>
+          <td></td>
+          <td></td>
+          <td></td>
+          <td></td>
           <td>$${fmt(totalSize, 2)}</td>
           <td class="${totalPnlClass}">${totalPnlUsdDisplay}</td>
           <td class="${totalPnlClass}">${totalPnlPctDisplay}</td>
-          <td></td>
-          <td></td>
-          <td></td>
         </tr>`;
       root.innerHTML = rows + totalsRow;
+    };
+
+    let _symbolChartInstance = null;
+    let _symbolChartSeries = null;
+    let _symbolChartRefreshId = null;
+    let _symbolChartCoin = null;
+    async function fetchAndSetCandles(coin, series) {
+      if (!series || !coin) return;
+      try {
+        const candlesUrl = "/portfolio?candles_coin=" + encodeURIComponent(coin) + "&candles_interval=15m&candles_limit=96&_t=" + Date.now();
+        const res = await fetch(candlesUrl);
+        const data = await res.json();
+        const candles = (data && data.candles) || [];
+        if (candles.length) {
+          const chartData = candles.map(c => ({ time: Math.floor(c.t / 1000), open: c.o, high: c.h, low: c.l, close: c.c }));
+          series.setData(chartData);
+        }
+      } catch (e) {}
+    }
+    async function openSymbolChart(pos) {
+      const modal = document.getElementById("symbol-chart-modal");
+      const titleEl = document.getElementById("symbol-chart-title");
+      const container = document.getElementById("symbol-chart-container");
+      const legendEl = document.getElementById("symbol-chart-legend");
+      const hlLink = document.getElementById("symbol-chart-hl-link");
+      const coin = (pos.coin || (pos.symbol || "").replace(/USDT$/i, "").trim()) || "BTC";
+      const symbol = pos.symbol || coin + "USDT";
+      titleEl.textContent = symbol + " (TP / SL)";
+      hlLink.href = "https://app.hyperliquid.xyz/trade/" + coin;
+      const entry = pos.entry_price != null && pos.entry_price !== "" ? Number(pos.entry_price) : null;
+      const tp = pos.tp_price != null && pos.tp_price !== "" ? Number(pos.tp_price) : null;
+      const sl = pos.sl_price != null && pos.sl_price !== "" ? Number(pos.sl_price) : null;
+      legendEl.textContent = (entry != null ? "Entry: " + entry.toFixed(4) : "") + (tp != null ? "  |  TP: " + tp.toFixed(4) : "") + (sl != null ? "  |  SL: " + sl.toFixed(4) : "") || "—";
+      if (_symbolChartRefreshId) {
+        clearInterval(_symbolChartRefreshId);
+        _symbolChartRefreshId = null;
+      }
+      if (_symbolChartInstance) {
+        _symbolChartInstance.remove();
+        _symbolChartInstance = null;
+      }
+      _symbolChartSeries = null;
+      _symbolChartCoin = null;
+      container.innerHTML = "";
+      modal.style.display = "flex";
+      try {
+        const candlesUrl = "/portfolio?candles_coin=" + encodeURIComponent(coin) + "&candles_interval=15m&candles_limit=96&_t=" + Date.now();
+        const res = await fetch(candlesUrl);
+        const data = await res.json();
+        const candles = (data && data.candles) || [];
+        if (typeof LightweightCharts === "undefined" || !candles.length) {
+          container.innerHTML = "<div style=\\\"padding:20px;color:var(--muted);\\\">" + (candles.length ? "Chart library not loaded." : "No candle data.") + "</div>";
+          return;
+        }
+        const chart = LightweightCharts.createChart(container, { layout: { background: { color: "transparent" }, textColor: "#8aa0b5" }, grid: { vertLines: { color: "#1f2a3c" }, horzLines: { color: "#1f2a3c" } }, width: container.clientWidth, height: 400, timeScale: { timeVisible: true, secondsVisible: false } });
+        _symbolChartInstance = chart;
+        const series = chart.addCandlestickSeries({ upColor: "#38d39f", downColor: "#ff7a7a", borderVisible: false });
+        const chartData = candles.map(c => ({ time: Math.floor(c.t / 1000), open: c.o, high: c.h, low: c.l, close: c.c }));
+        series.setData(chartData);
+        if (tp != null && tp > 0) series.createPriceLine({ price: tp, color: "#38d39f", lineWidth: 2, lineStyle: 2, axisLabelVisible: true, title: "TP" });
+        if (sl != null && sl > 0) series.createPriceLine({ price: sl, color: "#ff7a7a", lineWidth: 2, lineStyle: 2, axisLabelVisible: true, title: "SL" });
+        chart.timeScale().fitContent();
+        _symbolChartSeries = series;
+        _symbolChartCoin = coin;
+        _symbolChartRefreshId = setInterval(() => fetchAndSetCandles(coin, series), 15000);
+      } catch (e) {
+        container.innerHTML = "<div style=\\\"padding:20px;color:var(--danger);\\\">Failed to load chart.</div>";
+      }
+    }
+    document.addEventListener("click", (e) => {
+      const btn = e.target.closest(".symbol-chart-btn");
+      if (btn) {
+        e.preventDefault();
+        openSymbolChart({ symbol: btn.dataset.symbol, coin: btn.dataset.coin, entry_price: btn.dataset.entry, tp_price: btn.dataset.tp, sl_price: btn.dataset.sl });
+      }
+    });
+    document.getElementById("symbol-chart-close").addEventListener("click", () => {
+      const modal = document.getElementById("symbol-chart-modal");
+      modal.style.display = "none";
+      if (_symbolChartRefreshId) {
+        clearInterval(_symbolChartRefreshId);
+        _symbolChartRefreshId = null;
+      }
+      _symbolChartSeries = null;
+      _symbolChartCoin = null;
+      if (_symbolChartInstance) {
+        _symbolChartInstance.remove();
+        _symbolChartInstance = null;
+      }
+    });
+    document.getElementById("symbol-chart-modal").addEventListener("click", (e) => {
+      if (e.target.id === "symbol-chart-modal") {
+        document.getElementById("symbol-chart-close").click();
+      }
+    });
+
+    const renderSideCB = (scb) => {
+      const banner = document.getElementById("side-cb-banner");
+      if (!banner) return;
+      if (!scb || (!scb.long_blocked && !scb.short_blocked && !scb.risk_off)) {
+        banner.style.display = "none";
+        return;
+      }
+      let parts = [];
+      if (scb.risk_off) {
+        parts.push("⚠️ <b>RISK-OFF</b> " + scb.risk_off_remaining_h.toFixed(1) + "h remaining");
+      }
+      if (scb.long_blocked) {
+        parts.push("🔒 LONG blocked " + scb.long_remaining_h.toFixed(1) + "h");
+      } else {
+        parts.push("🟢 LONG active (streak: " + (scb.long_streak || 0) + ")");
+      }
+      if (scb.short_blocked) {
+        parts.push("🔒 SHORT blocked " + scb.short_remaining_h.toFixed(1) + "h");
+      } else {
+        parts.push("🟢 SHORT active (streak: " + (scb.short_streak || 0) + ")");
+      }
+      banner.innerHTML = parts.join(" &nbsp;|&nbsp; ");
+      banner.style.display = "block";
+      banner.style.borderColor = scb.risk_off ? "rgba(255,80,80,0.5)" : "rgba(255,180,0,0.3)";
+      banner.style.background = scb.risk_off ? "rgba(255,80,80,0.12)" : "rgba(255,180,0,0.12)";
     };
 
     const renderLast10Closed = (root, trades) => {
@@ -2886,10 +3190,16 @@ async def portfolio_dashboard():
         localStorage.setItem(MARKETCAP_STORAGE_KEY, on ? "1" : "0");
       } catch (e) {}
     }
+    const FETCH_TIMEOUT_MS = 45000;
+    function fetchWithTimeout(url) {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+      return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
+    }
     async function fetchMarketCapHistory() {
       try {
         const rangeParam = _dashboardRange === "all" ? "" : "&range=" + encodeURIComponent(_dashboardRange);
-        const res = await fetch("/portfolio?_t=" + Date.now() + rangeParam + "&include_market_cap=1&market_cap_days=365");
+        const res = await fetchWithTimeout("/portfolio?_t=" + Date.now() + rangeParam + "&include_market_cap=1&market_cap_days=365");
         const data = await res.json();
         if (data && data.ok && Array.isArray(data.market_cap)) _marketCapData = data.market_cap;
         else _marketCapData = [];
@@ -2902,9 +3212,11 @@ async def portfolio_dashboard():
     }
     async function load() {
       const updatedEl = document.getElementById("updated");
+      const retrySpan = document.getElementById("retry-span");
+      if (retrySpan) retrySpan.style.display = "none";
       try {
         const rangeParam = _dashboardRange === "all" ? "" : "&range=" + encodeURIComponent(_dashboardRange);
-        const res = await fetch("/portfolio?_t=" + Date.now() + rangeParam);
+        const res = await fetchWithTimeout("/portfolio?_t=" + Date.now() + rangeParam);
         if (!res.ok) {
           updatedEl.textContent = "Error: HTTP " + res.status + " — check server";
           renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), [], {});
@@ -2956,8 +3268,14 @@ async def portfolio_dashboard():
         _lastChartTrades = chartTrades;
         _lastHl = hl;
         const showMc = getShowMarketCap();
-        if (showMc && _marketCapData.length === 0) await fetchMarketCapHistory();
         renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), chartTrades, { showMarketCap: showMc, marketCapData: _marketCapData, currentEquity: hl.equity });
+        if (showMc && _marketCapData.length === 0) {
+          fetchMarketCapHistory().then(() => {
+            const root = document.getElementById("pnl-chart-container");
+            const wrap = document.getElementById("pnl-chart-overview-wrap");
+            if (root && wrap) renderPnlChart(root, wrap, _lastChartTrades, { showMarketCap: true, marketCapData: _marketCapData, currentEquity: _lastHl && _lastHl.equity });
+          });
+        }
         renderCards(document.getElementById("hl-cards"), hl);
         renderOverviewTable(document.getElementById("hl-overview"), hl.overview_breakdown || null);
         renderPnlCalendar(hl.daily_pnl || []);
@@ -2966,6 +3284,7 @@ async def portfolio_dashboard():
         renderLast10Closed(document.getElementById("hl-last-10-closed"), hl.last_10_trades || []);
         renderTraderActions(document.getElementById("hl-trader-actions"), hl.trader_actions || []);
         renderDepositWithdrawalHistory(document.getElementById("hl-deposit-withdrawal-history"), hl.deposit_withdrawal_history || []);
+        renderSideCB(data.side_cb || null);
         if (hl.per_symbol_pnl && Array.isArray(hl.per_symbol_pnl)) {
           renderPerSymbolPnl(document.getElementById("per-symbol-pnl-body"), hl.per_symbol_pnl, hl.range);
           const perSymbolTitle = document.getElementById("per-symbol-pnl-title");
@@ -2976,7 +3295,9 @@ async def portfolio_dashboard():
         setRangeButtons(hl.range || "all");
         _dashboardRange = hl.range || "all";
       } catch (err) {
-        updatedEl.textContent = "Error: " + (err.message || "failed to load");
+        const isTimeout = (err && err.name === "AbortError") || (err && err.message && err.message.toLowerCase().indexOf("abort") !== -1);
+        updatedEl.textContent = isTimeout ? "Request timed out. Check connection and retry." : ("Error: " + (err.message || "failed to load"));
+        if (retrySpan) retrySpan.style.display = "inline";
         renderPnlChart(document.getElementById("pnl-chart-container"), document.getElementById("pnl-chart-overview-wrap"), [], {});
         renderCards(document.getElementById("hl-cards"), {});
         renderOverviewTable(document.getElementById("hl-overview"), null);
@@ -2993,6 +3314,8 @@ async def portfolio_dashboard():
 
     setRangeButtons("all");
     setupPerSymbolSort();
+    const retryLink = document.getElementById("retry-link");
+    if (retryLink) retryLink.addEventListener("click", function(e) { e.preventDefault(); load(); });
     const savedShowMc = localStorage.getItem(MARKETCAP_STORAGE_KEY) === "1";
     const chartCb = document.getElementById("pnl-chart-show-marketcap");
     if (chartCb) chartCb.checked = savedShowMc;
@@ -3010,12 +3333,12 @@ async def portfolio_dashboard():
       });
     }
     load();
-    setInterval(load, 60000);  // 60s — throttle to avoid flip; chart/metrics from file, only equity/positions refresh
+    setInterval(load, 15000);  // 15s — HL allows 1200 weight/min; portfolio ~5-6 req/fetch, safe at 4/min
     setInterval(async () => {
       const root = document.getElementById("hl-trader-actions");
       if (!root) return;
       try {
-        const res = await fetch("/trader-actions?_t=" + Date.now());
+        const res = await fetch("/portfolio?actions_only=1&actions_limit=30&_t=" + Date.now());
         const data = await res.json();
         if (data && data.ok && Array.isArray(data.actions)) renderTraderActions(root, data.actions);
       } catch (e) {}
